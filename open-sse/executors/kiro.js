@@ -6,6 +6,8 @@ import { refreshKiroToken } from "../services/tokenRefresh.js";
 import { SSE_DONE, SSE_HEADERS } from "../utils/sseConstants.js";
 import { getCapabilitiesForModel } from "../providers/capabilities.js";
 import { STREAM_FIRST_CHUNK_TIMEOUT_MS } from "../config/runtimeConfig.js";
+import { getKiroUsage } from "../services/usage/kiro.js";
+import { KIRO_CREDIT_EXHAUSTION_PROBE_MS } from "../config/errorConfig.js";
 
 const KIRO_TOOL_CALL_WRAPPER = "tool_call";
 const KIRO_TOOL_CALL_REPAIR_BUFFER_MAX_BYTES_ENV = "KIRO_TOOL_CALL_REPAIR_BUFFER_MAX_BYTES";
@@ -537,6 +539,54 @@ function emitKiroToolCallValidationError(controller, state, message, options = {
 }
 
 /**
+ * Confirmed-exhaustion signal for Kiro's monthly credit quota. Verified against a real
+ * CodeWhisperer GenerateAssistantResponse 402 body (AWS ServiceQuotaExceededException):
+ *   { "message": "You have reached the limit.",
+ *     "cause": { "$metadata": { "httpStatusCode": 402 }, "name": "ServiceQuotaExceededException",
+ *                "reason": "MONTHLY_REQUEST_COUNT" } }
+ * Some surfaces flatten `cause.name`/`cause.reason` onto the top-level object instead, so both
+ * shapes are checked. Any other 402 (bad payment method, suspended account, unrecognized shape)
+ * is left ambiguous and keeps the existing generic 402 cooldown (open-sse/config/errorConfig.js).
+ */
+const KIRO_QUOTA_EXCEEDED_EXCEPTION = "ServiceQuotaExceededException";
+const KIRO_QUOTA_EXCEEDED_REASON = "MONTHLY_REQUEST_COUNT";
+
+/** Follow-up quota-lookup timeout — bounds how long a confirmed-402 error response can wait. */
+const KIRO_RESET_LOOKUP_TIMEOUT_MS = 8000;
+
+function isConfirmedKiroCreditExhaustion(bodyText) {
+  if (!bodyText) return false;
+  try {
+    const json = JSON.parse(bodyText);
+    const name = json?.name ?? json?.cause?.name;
+    const reason = json?.reason ?? json?.cause?.reason;
+    if (name === KIRO_QUOTA_EXCEEDED_EXCEPTION && reason === KIRO_QUOTA_EXCEEDED_REASON) return true;
+  } catch { /* not JSON — fall through to the text-based check below */ }
+  const lower = bodyText.toLowerCase();
+  return lower.includes(KIRO_QUOTA_EXCEEDED_EXCEPTION.toLowerCase())
+    && lower.includes(KIRO_QUOTA_EXCEEDED_REASON.toLowerCase());
+}
+
+/** Earliest resetAt (ms epoch) among fully-depleted quota buckets, or null if none/unknown. */
+function earliestDepletedResetMs(quotas) {
+  let earliest = null;
+  for (const quota of Object.values(quotas || {})) {
+    if (!quota || quota.unlimited || !(quota.total > 0) || quota.remaining > 0 || !quota.resetAt) continue;
+    const ms = new Date(quota.resetAt).getTime();
+    if (!Number.isFinite(ms)) continue;
+    if (earliest === null || ms < earliest) earliest = ms;
+  }
+  return earliest;
+}
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(null), ms)),
+  ]);
+}
+
+/**
  * KiroExecutor - Executor for Kiro AI (AWS CodeWhisperer)
  * Uses AWS CodeWhisperer streaming API with AWS EventStream binary format
  */
@@ -621,6 +671,42 @@ export class KiroExecutor extends BaseExecutor {
 
   transformRequest(model, body, stream, credentials) {
     return body;
+  }
+
+  /**
+   * Classify a Kiro 402 as confirmed monthly-credit exhaustion vs. ambiguous (bad payment
+   * method, suspended account, unrecognized upstream shape — see isConfirmedKiroCreditExhaustion
+   * doc above). Only a confirmed match gets a precise cooldown; everything else falls through
+   * to the base classifier and keeps the existing generic 402 cooldown unchanged.
+   *
+   * The 402 body itself never carries a reset time, so on a confirmed match this makes a
+   * best-effort follow-up call to Kiro's own quota API (GetUsageLimits) for the trustworthy
+   * `resetAt` already surfaced there (services/usage/kiro.js). If that lookup is unreachable,
+   * times out, or shows nothing depleted, resetsAtMs falls back to a bounded daily-probe
+   * window rather than guessing a date — markAccountUnavailable caps either case at
+   * KIRO_CREDIT_EXHAUSTION_PROBE_MS (see errorConfig.js) so the account is retried at most
+   * about once a day until it recovers.
+   */
+  async parseError(response, bodyText, credentials, proxyOptions) {
+    if (response.status !== 402 || !isConfirmedKiroCreditExhaustion(bodyText)) {
+      return super.parseError(response, bodyText);
+    }
+
+    let resetsAtMs = null;
+    try {
+      const accessToken = credentials?.apiKey || credentials?.accessToken;
+      const usage = await withTimeout(
+        getKiroUsage(accessToken, credentials?.providerSpecificData, proxyOptions),
+        KIRO_RESET_LOOKUP_TIMEOUT_MS
+      );
+      resetsAtMs = earliestDepletedResetMs(usage?.quotas);
+    } catch { /* best-effort only — fall back to the daily probe below */ }
+
+    if (!resetsAtMs || resetsAtMs <= Date.now()) {
+      resetsAtMs = Date.now() + KIRO_CREDIT_EXHAUSTION_PROBE_MS;
+    }
+
+    return { status: 402, message: "Kiro monthly credit limit reached", resetsAtMs };
   }
 
   /**
