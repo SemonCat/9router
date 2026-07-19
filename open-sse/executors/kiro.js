@@ -54,6 +54,7 @@ const KIRO_SHORT_FINAL_PREFIXES = Object.freeze([
   "接下來",
   "下一步",
   "我只再",
+  "我會重新抓取",
   "next",
   "now",
   "then",
@@ -63,7 +64,7 @@ const KIRO_SHORT_FINAL_PREFIXES = Object.freeze([
   "i need to",
   "let me"
 ]);
-const KIRO_SHORT_FUTURE_ACTION_PATTERN = /^(?:(?:(?:現在|接著|接下來|下一步)[，,:：\s]*(?:我(?:只)?(?:會|要|將|再)?\s*)?|我只再)(?:補|查|確認|驗證|追(?:查|蹤)?|繼續|檢查|測試)|(?:(?:next|now|then)\b[\s,:-]*)?(?:i(?:'ll| will| am going to| need to)|let me)\s+(?:verify|check|confirm|validate|investigate|trace|continue|follow up|test)\b)/iu;
+const KIRO_SHORT_FUTURE_ACTION_PATTERN = /^(?:(?:(?:現在|接著|接下來|下一步)[，,:：\s]*(?:我(?:只)?(?:會|要|將|再)?\s*)?|我只再)(?:補|查|確認|驗證|追(?:查|蹤)?|繼續|檢查|測試)|我會重新抓取(?=[\s\S]*調查會以[\s\S]+為準[。.!]?$)|(?:(?:next|now|then)\b[\s,:-]*)?(?:i(?:'ll| will| am going to| need to)|let me)\s+(?:verify|check|confirm|validate|investigate|trace|continue|follow up|test)\b)/iu;
 const KIRO_SHORT_FINAL_USER_WAIT_PATTERN = /(?:請(?:你|先)|你(?:先|需要|可以|提供|確認|批准|允許)|等待(?:你|使用者)|等你|核准|同意|授權|\b(?:after|when|once)\s+you\b|\byour\s+(?:approval|confirmation|permission|input)\b|\bwait(?:ing)?\s+for\s+you\b|\bplease\s+(?:approve|confirm|provide|send)\b)/iu;
 const KIRO_SHORT_FINAL_COMPLETE_PATTERN = /(?:已(?:經)?完成|完成(?:了|驗證|確認)|修復完成|確認無誤|驗證(?:完成|通過)|測試(?:均)?通過|結論|總結|\b(?:done|completed|fixed|verified|confirmed|passed|in conclusion|summary)\b|\b(?:is|are) complete\b)/iu;
 const CRC32_TABLE = Uint32Array.from({ length: 256 }, (_, index) => {

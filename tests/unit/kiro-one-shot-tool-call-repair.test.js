@@ -965,6 +965,7 @@ describe("Kiro one-shot tool_call repair", () => {
     it.each([
       "接下來我只再確認部署結果。",
       "現在我會繼續追查剩下的日誌。",
+      "我會重新抓取 parent thread、指定 Sentry event 與 issue 最新分布，並以目前程式碼/git lineage 交叉驗證；以下調查會以這次查詢結果為準。",
       "Next I'll verify the deployment logs.",
       "I'll verify the deployment logs now.",
       "Let me check the remaining failures."
@@ -984,6 +985,39 @@ describe("Kiro one-shot tool_call repair", () => {
         stream: true,
         credentials
       });
+      const text = await collectText(result.response.body);
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(text).toContain("Verification completed successfully.");
+      expect(text).not.toContain(shortFinal);
+    });
+
+    it("holds the observed Chinese progress-only final until terminal classification", async () => {
+      const shortFinal = "我會重新抓取 parent thread、指定 Sentry event 與 issue 最新分布，並以目前程式碼/git lineage 交叉驗證；以下調查會以這次查詢結果為準。";
+      const executor = new KiroExecutor();
+      const firstAttempt = controlledEventStreamResponse([
+        encodeEventFrame("assistantResponseEvent", { content: shortFinal })
+      ]);
+      fetchMock
+        .mockResolvedValueOnce(firstAttempt.response)
+        .mockResolvedValueOnce(eventStreamResponse([
+          encodeEventFrame("assistantResponseEvent", { content: "Verification completed successfully." })
+        ]));
+
+      const resultPromise = executor.execute({
+        model: "kr/gpt-5.6-sol",
+        body: { conversationState: {} },
+        stream: true,
+        credentials
+      });
+      const earlyResult = await Promise.race([
+        resultPromise.then(() => "settled"),
+        new Promise((resolve) => setTimeout(() => resolve("pending"), 25))
+      ]);
+
+      expect(earlyResult).toBe("pending");
+      firstAttempt.close();
+      const result = await resultPromise;
       const text = await collectText(result.response.body);
 
       expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -1018,6 +1052,11 @@ describe("Kiro one-shot tool_call repair", () => {
     it.each([
       "接下來請你先批准部署，我會等待你的確認。",
       "已完成驗證，所有測試均通過。",
+      "我會建議先正規化 response shape，再補上欄位驗證。",
+      "我會補充兩點：第一，response shape 應正規化；第二，欄位需要驗證。",
+      "我會重新抓取最新資料；調查完成，結果如下：無異常。",
+      "我會重新抓取最新資料；目前結果顯示所有事件均無異常。",
+      "我會重新抓取最新資料；調查已完成，以下是完整結論。",
       "Next I'll verify after you approve the deployment.",
       "The verification is complete and all tests passed."
     ])("does not retry an excluded or completed short final: %s", async (finalText) => {
