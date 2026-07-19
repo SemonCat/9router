@@ -147,6 +147,59 @@ describe("KiroExecutor thinking tag stripping", () => {
     expect(contentChunks.length).toBe(0);
   });
 
+  it("preserves Kiro meteringEvent usage on the final token-usage chunk", async () => {
+    const executor = new KiroExecutor();
+    const frames = [
+      createMockFrame("assistantResponseEvent", { content: "OK" }),
+      createMockFrame("meteringEvent", { usage: 0.0097, unit: "credit", unitPlural: "credits" }),
+      createMockFrame("contextUsageEvent", { contextUsagePercentage: 1 }),
+    ];
+    const readableStream = new ReadableStream({
+      start(controller) {
+        for (const frame of frames) controller.enqueue(frame);
+        controller.close();
+      }
+    });
+
+    const output = await readAllSSE(
+      executor.transformEventStreamToSSE({ body: readableStream }, "claude-test").body
+    );
+    const objects = output
+      .split("\n")
+      .filter(line => line.startsWith("data: ") && !line.includes("[DONE]"))
+      .map(line => JSON.parse(line.slice(6)));
+    const usageChunk = objects.find(obj => obj.usage?.kiro_credits !== undefined);
+
+    expect(usageChunk.usage.kiro_credits).toBe(0.0097);
+    expect(usageChunk.usage.kiro_credit_unit).toBe("credit");
+    expect(usageChunk.usage.prompt_tokens).toBeGreaterThan(0);
+  });
+
+  it("emits Kiro metering usage when messageStop arrives first", async () => {
+    const executor = new KiroExecutor();
+    const frames = [
+      createMockFrame("assistantResponseEvent", { content: "OK" }),
+      createMockFrame("messageStopEvent", {}),
+      createMockFrame("meteringEvent", { usage: 0.0061, unit: "credit", unitPlural: "credits" }),
+    ];
+    const readableStream = new ReadableStream({
+      start(controller) {
+        for (const frame of frames) controller.enqueue(frame);
+        controller.close();
+      }
+    });
+
+    const output = await readAllSSE(
+      executor.transformEventStreamToSSE({ body: readableStream }, "claude-test").body
+    );
+    const objects = output
+      .split("\n")
+      .filter(line => line.startsWith("data: ") && !line.includes("[DONE]"))
+      .map(line => JSON.parse(line.slice(6)));
+
+    expect(objects.some(obj => obj.usage?.kiro_credits === 0.0061)).toBe(true);
+  });
+
   it("waits for clean EOF before emitting stop after messageStop", async () => {
     const executor = new KiroExecutor();
 

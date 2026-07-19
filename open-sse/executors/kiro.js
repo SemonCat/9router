@@ -921,7 +921,7 @@ export class KiroExecutor extends BaseExecutor {
   async openToolCallRepairGate(rawResponse, args, options) {
     let invalidToolCall = null;
     let terminalDiagnostics = null;
-    const transformed = this.transformEventStreamToSSE(rawResponse, args.model, {
+    const transformOptions = {
       onInvalidToolCall: (message) => {
         invalidToolCall = message;
       },
@@ -930,7 +930,8 @@ export class KiroExecutor extends BaseExecutor {
       },
       suppressInvalidToolCallError: options.suppressInvalidToolCallError,
       invalidToolCallErrorCode: options.invalidToolCallErrorCode
-    });
+    };
+    const transformed = this.transformEventStreamToSSE(rawResponse, args.model, transformOptions);
     const reader = transformed.body.getReader();
     const bufferedChunks = [];
     let totalBytes = 0;
@@ -1001,6 +1002,10 @@ export class KiroExecutor extends BaseExecutor {
             return { kind: gatedOutputKind };
           }
 
+          // The repair gate no longer owns validation failures after bytes are
+          // released to the client. Surface any later malformed tool call as a
+          // terminal SSE error instead of silently closing a partial 200 stream.
+          transformOptions.suppressInvalidToolCallError = false;
           return {
             kind: "stream",
             firstChunk: concatChunks(bufferedChunks, totalBytes),
@@ -1011,6 +1016,7 @@ export class KiroExecutor extends BaseExecutor {
         // Match Kiro CLI streaming behavior: once output cannot be an
         // ellipsis-only false final, release it without waiting for EOF.
         if (inspection.safeToStream) {
+          transformOptions.suppressInvalidToolCallError = false;
           return {
             kind: "stream",
             firstChunk: concatChunks(bufferedChunks, totalBytes),

@@ -201,6 +201,45 @@ describe("Kiro one-shot tool_call repair", () => {
     await reader.cancel("test complete").catch(() => {});
   });
 
+  it("surfaces a malformed tool call that arrives after streamed text", async () => {
+    const executor = new KiroExecutor();
+    const upstream = controlledEventStreamResponse([
+      encodeEventFrame("assistantResponseEvent", { content: "hello" })
+    ]);
+    fetchMock.mockResolvedValueOnce(upstream.response);
+
+    const result = await executor.execute({
+      model: "kr/claude-opus-4.8",
+      body: { conversationState: {} },
+      stream: true,
+      credentials
+    });
+    const reader = result.response.body.getReader();
+    const decoder = new TextDecoder();
+    const firstRead = await reader.read();
+    let text = decoder.decode(firstRead.value, { stream: true });
+
+    upstream.enqueue(encodeEventFrame("toolUseEvent", {
+      toolUseId: "call_late",
+      name: "tool_call",
+      input: { arguments: { q: "router" } }
+    }));
+    upstream.close();
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      text += decoder.decode(value, { stream: true });
+    }
+    text += decoder.decode();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(text).toContain("hello");
+    expect(text).toContain("invalid_kiro_tool_call");
+    expect(text).toContain("data: [DONE]");
+    expect(text).not.toContain("\"finish_reason\":\"stop\"");
+  });
+
   it("propagates client cancellation after the happy-path gate opens", async () => {
     const executor = new KiroExecutor();
     let cancelCount = 0;
