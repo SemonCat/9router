@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   getProviderCredentials: vi.fn(),
   markAccountUnavailable: vi.fn(),
   clearAccountError: vi.fn(),
+  classifySessionAffinityFailure: vi.fn(),
   getModelInfo: vi.fn(),
   getComboModels: vi.fn(),
   handleChatCore: vi.fn(),
@@ -17,6 +18,7 @@ vi.mock("../../src/sse/services/auth.js", () => ({
   getProviderCredentials: mocks.getProviderCredentials,
   markAccountUnavailable: mocks.markAccountUnavailable,
   clearAccountError: mocks.clearAccountError,
+  classifySessionAffinityFailure: mocks.classifySessionAffinityFailure,
   extractApiKey: vi.fn(() => null),
   isValidApiKey: vi.fn(),
 }));
@@ -59,6 +61,7 @@ describe("chat aggregate account locks", () => {
     mocks.getModelInfo.mockResolvedValue({ provider: "kiro", model: "gpt-5.6-sol" });
     mocks.checkAndRefreshToken.mockImplementation(async (_provider, credentials) => credentials);
     mocks.markAccountUnavailable.mockResolvedValue({ shouldFallback: true, cooldownMs: 120_000 });
+    mocks.classifySessionAffinityFailure.mockReturnValue({ mode: "hard-rebind", reason: "quota_exhausted" });
   });
 
   afterEach(() => {
