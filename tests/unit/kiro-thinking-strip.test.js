@@ -2,6 +2,17 @@ import { describe, it, expect } from "vitest";
 import { KiroExecutor } from "../../open-sse/executors/kiro.js";
 import "../translator/registerAll.js";
 
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) {
+      crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
 function createMockFrame(eventType, payloadObj) {
   const payloadStr = JSON.stringify(payloadObj);
   const payloadBytes = new TextEncoder().encode(payloadStr);
@@ -32,6 +43,8 @@ function createMockFrame(eventType, payloadObj) {
   offset += headerValueBytes.length;
 
   buffer.set(payloadBytes, offset);
+  view.setUint32(8, crc32(buffer.subarray(0, 8)), false);
+  view.setUint32(totalLength - 4, crc32(buffer.subarray(0, totalLength - 4)), false);
   
   return buffer;
 }
@@ -134,14 +147,16 @@ describe("KiroExecutor thinking tag stripping", () => {
     expect(contentChunks.length).toBe(0);
   });
 
-  it("emits a terminal chunk at messageStop before the upstream stream closes", async () => {
+  it("waits for clean EOF before emitting stop after messageStop", async () => {
     const executor = new KiroExecutor();
 
     const f1 = createMockFrame("assistantResponseEvent", { content: "OK" });
     const f2 = createMockFrame("messageStopEvent", {});
 
+    let upstreamController;
     const readableStream = new ReadableStream({
       start(controller) {
+        upstreamController = controller;
         controller.enqueue(f1);
         controller.enqueue(f2);
       }
@@ -151,11 +166,18 @@ describe("KiroExecutor thinking tag stripping", () => {
     const reader = transformedResponse.body.getReader();
     const decoder = new TextDecoder();
     let output = "";
-    for (let i = 0; i < 4 && !output.includes("\"finish_reason\":\"stop\""); i++) {
+    for (let i = 0; i < 2; i++) {
       const { value } = await readNextWithTimeout(reader);
       output += decoder.decode(value, { stream: true });
     }
-    await reader.cancel();
+    expect(output).not.toContain("\"finish_reason\":\"stop\"");
+
+    upstreamController.close();
+    while (!output.includes("\"finish_reason\":\"stop\"")) {
+      const { value, done } = await readNextWithTimeout(reader);
+      if (done) break;
+      output += decoder.decode(value, { stream: true });
+    }
 
     expect(output).toContain("\"finish_reason\":\"stop\"");
   });

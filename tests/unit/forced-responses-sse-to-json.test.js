@@ -129,3 +129,49 @@ describe("forced Responses SSE to JSON terminal handling", () => {
     expect(gemini.usageMetadata.totalTokenCount).toBe(9);
   });
 });
+
+describe("forced Chat Completions SSE to JSON terminal handling", () => {
+  it("returns an upstream failure when a top-level SSE error follows semantic output", async () => {
+    const encoder = new TextEncoder();
+    const sse = [
+      `data: ${JSON.stringify({
+        id: "chatcmpl_kiro",
+        model: "kr/gpt-5.6-sol",
+        choices: [{ index: 0, delta: { content: "partial" }, finish_reason: null }]
+      })}`,
+      `data: ${JSON.stringify({
+        error: {
+          message: "Kiro stream ended incompletely or without model output",
+          type: "upstream_error",
+          code: "kiro_missing_terminal"
+        }
+      })}`,
+      "data: [DONE]",
+      ""
+    ].join("\n\n");
+    const result = await handleForcedSSEToJson({
+      providerResponse: new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(sse));
+          controller.close();
+        }
+      }), { headers: { "content-type": "text/event-stream" } }),
+      sourceFormat: FORMATS.OPENAI,
+      provider: "kiro",
+      model: "kr/gpt-5.6-sol",
+      body: { model: "kr/gpt-5.6-sol", messages: [] },
+      stream: false,
+      requestStartTime: Date.now(),
+      connectionId: "test-connection",
+      clientRawRequest: { endpoint: "/v1/chat/completions" },
+      trackDone: vi.fn(),
+      appendLog: vi.fn()
+    });
+    const json = await result.response.json();
+
+    expect(result.success).toBe(false);
+    expect(result.response.status).toBe(502);
+    expect(json.error.message).toContain("Kiro stream ended incompletely");
+    expect(json).not.toHaveProperty("choices");
+  });
+});
