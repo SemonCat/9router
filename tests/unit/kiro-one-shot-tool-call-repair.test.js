@@ -23,6 +23,16 @@ function encodeHeader(name, value) {
   return out;
 }
 
+function concatBytes(chunks) {
+  const out = new Uint8Array(chunks.reduce((total, chunk) => total + chunk.byteLength, 0));
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
 function crc32(bytes) {
   let crc = 0xffffffff;
   for (const byte of bytes) {
@@ -41,8 +51,8 @@ function writeFrameChecksums(frame) {
   return frame;
 }
 
-function encodeEventFrame(eventType, payload) {
-  const headers = encodeHeader(":event-type", eventType);
+function encodeFrame(headerValues, payload) {
+  const headers = concatBytes(Object.entries(headerValues).map(([name, value]) => encodeHeader(name, value)));
   const payloadBytes = new TextEncoder().encode(JSON.stringify(payload));
   const totalLength = 12 + headers.length + payloadBytes.length + 4;
   const frame = new Uint8Array(totalLength);
@@ -52,6 +62,10 @@ function encodeEventFrame(eventType, payload) {
   frame.set(headers, 12);
   frame.set(payloadBytes, 12 + headers.length);
   return writeFrameChecksums(frame);
+}
+
+function encodeEventFrame(eventType, payload) {
+  return encodeFrame({ ":event-type": eventType }, payload);
 }
 
 function eventStreamResponse(frames, status = 200) {
@@ -803,6 +817,36 @@ describe("Kiro one-shot tool_call repair", () => {
       expect(text).not.toContain('"finish_reason":"stop"');
     });
 
+    it.each(["exception", "error"])(
+      "treats an AWS EventStream %s message after semantic output as terminal failure",
+      async (messageType) => {
+        const executor = new KiroExecutor();
+        const upstream = controlledEventStreamResponse([
+          encodeEventFrame("assistantResponseEvent", { content: "Visible before upstream exception." })
+        ]);
+        fetchMock.mockResolvedValueOnce(upstream.response);
+
+        const result = await executor.execute({
+          model: "kr/gpt-5.6-sol",
+          body: { conversationState: {} },
+          stream: true,
+          credentials
+        });
+        upstream.enqueue(encodeFrame({
+          ":message-type": messageType,
+          ...(messageType === "exception" ? { ":exception-type": "InternalServerException" } : {})
+        }, { message: "upstream failed" }));
+        upstream.close();
+        const text = await collectText(result.response.body);
+
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(text).toContain("Visible before upstream exception.");
+        expect(text).toContain('"code":"kiro_missing_terminal"');
+        expect(text).toContain('"terminal_provenance":"upstream_eventstream_error"');
+        expect(text).not.toContain('"finish_reason":"stop"');
+      }
+    );
+
     it("rejects a message CRC mismatch and retries before releasing output", async () => {
       const corrupt = encodeEventFrame("assistantResponseEvent", { content: "CRC-corrupt output." });
       corrupt[corrupt.byteLength - 1] ^= 0xff;
@@ -921,7 +965,9 @@ describe("Kiro one-shot tool_call repair", () => {
     it.each([
       "接下來我只再確認部署結果。",
       "現在我會繼續追查剩下的日誌。",
-      "Next I'll verify the deployment logs."
+      "Next I'll verify the deployment logs.",
+      "I'll verify the deployment logs now.",
+      "Let me check the remaining failures."
     ])("retries a Kiro-only short future-action final: %s", async (shortFinal) => {
       const executor = new KiroExecutor();
       fetchMock
