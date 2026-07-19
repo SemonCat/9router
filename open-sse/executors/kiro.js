@@ -13,6 +13,22 @@ const KIRO_TOOL_CALL_REPAIR_TIMEOUT_MS_ENV = "KIRO_TOOL_CALL_REPAIR_TIMEOUT_MS";
 const KIRO_TOOL_CALL_REPAIR_TTFT_TIMEOUT_MS_ENV = "KIRO_TOOL_CALL_REPAIR_TTFT_TIMEOUT_MS";
 const KIRO_TOOL_CALL_REPAIR_STALL_TIMEOUT_MS_ENV = "KIRO_TOOL_CALL_REPAIR_STALL_TIMEOUT_MS";
 const KIRO_TOOL_CALL_REPAIR_BUFFER_MAX_BYTES = 8 * 1024 * 1024;
+const KIRO_TERMINAL_PROVENANCE = Object.freeze({
+  MESSAGE_STOP: "message_stop_event",
+  TOOL_CALL_EOF: "tool_call_eof_legacy_exception",
+  UPSTREAM_EOF: "upstream_eof",
+  MISSING_BODY: "missing_response_body"
+});
+const KIRO_DIAGNOSTIC_EVENT_TYPES = Object.freeze([
+  "assistantResponseEvent",
+  "reasoningContentEvent",
+  "codeEvent",
+  "toolUseEvent",
+  "messageStopEvent",
+  "contextUsageEvent",
+  "meteringEvent",
+  "metricsEvent"
+]);
 const KIRO_TOOL_CALL_REPAIR_INSTRUCTION = [
   "Retry the previous response because its Kiro tool_call wrapper was malformed.",
   "If you use the wrapper tool named tool_call, its input must be a JSON object with a non-empty string name and an arguments field.",
@@ -205,6 +221,66 @@ function formatKiroEllipsisRetryFailure() {
     statusText: "Bad Gateway",
     headers: { "Content-Type": "application/json" }
   });
+}
+
+function createKiroEventCounts() {
+  return Object.fromEntries([
+    ...KIRO_DIAGNOSTIC_EVENT_TYPES.map((eventType) => [eventType, 0]),
+    ["other", 0]
+  ]);
+}
+
+function incrementKiroEventCount(eventCounts, eventType) {
+  const key = KIRO_DIAGNOSTIC_EVENT_TYPES.includes(eventType) ? eventType : "other";
+  eventCounts[key]++;
+}
+
+function sanitizeKiroTerminalDiagnostics(diagnostics) {
+  return {
+    terminal_provenance: diagnostics?.terminal_provenance || KIRO_TERMINAL_PROVENANCE.UPSTREAM_EOF,
+    event_counts: { ...createKiroEventCounts(), ...(diagnostics?.event_counts || {}) },
+    incomplete_frame_bytes: Number(diagnostics?.incomplete_frame_bytes) || 0
+  };
+}
+
+function logKiroTerminalDiagnostics(model, attempt, diagnostics) {
+  const safe = sanitizeKiroTerminalDiagnostics(diagnostics);
+  const entry = JSON.stringify({ model, attempt, ...safe });
+  if (safe.terminal_provenance === KIRO_TERMINAL_PROVENANCE.UPSTREAM_EOF ||
+      safe.terminal_provenance === KIRO_TERMINAL_PROVENANCE.MISSING_BODY) {
+    console.warn(`[Kiro] Terminal integrity failure ${entry}`);
+  } else if (safe.terminal_provenance === KIRO_TERMINAL_PROVENANCE.TOOL_CALL_EOF) {
+    console.warn(`[Kiro] Explicit tool-call EOF compatibility path ${entry}`);
+  }
+  return safe;
+}
+
+function formatKiroMissingTerminalRetryFailure(attempts) {
+  return new Response(JSON.stringify({
+    error: {
+      message: "Kiro upstream ended without messageStopEvent after one bounded retry",
+      type: "upstream_error",
+      code: "kiro_missing_terminal_retry_failed",
+      details: {
+        attempts: attempts.map(sanitizeKiroTerminalDiagnostics)
+      }
+    }
+  }), {
+    status: 502,
+    statusText: "Bad Gateway",
+    headers: { "Content-Type": "application/json" }
+  });
+}
+
+function formatKiroMissingTerminalSSE(diagnostics) {
+  return encodeSSE(`data: ${JSON.stringify({
+    error: {
+      message: "Kiro upstream ended without messageStopEvent",
+      type: "upstream_error",
+      code: "kiro_missing_terminal",
+      details: sanitizeKiroTerminalDiagnostics(diagnostics)
+    }
+  })}\n\ndata: [DONE]\n\n`);
 }
 
 function formatKiroToolCallRepairError(message, code = "kiro_tool_call_repair_failed") {
@@ -466,10 +542,7 @@ export class KiroExecutor extends BaseExecutor {
   async execute(args) {
     const result = await super.execute(args);
     if (result?.response?.ok) {
-      if (args.stream !== false) {
-        return this.createToolCallRepairResult(result, args);
-      }
-      result.response = this.transformEventStreamToSSE(result.response, args.model);
+      return this.createToolCallRepairResult(result, args);
     }
     return result;
   }
@@ -486,17 +559,21 @@ export class KiroExecutor extends BaseExecutor {
     const legacyTimeoutMs = envInt(KIRO_TOOL_CALL_REPAIR_TIMEOUT_MS_ENV, STREAM_FIRST_CHUNK_TIMEOUT_MS);
     const ttftTimeoutMs = envInt(KIRO_TOOL_CALL_REPAIR_TTFT_TIMEOUT_MS_ENV, legacyTimeoutMs);
     const stallTimeoutMs = envInt(KIRO_TOOL_CALL_REPAIR_STALL_TIMEOUT_MS_ENV, legacyTimeoutMs);
+    const toolCallRepairEnabled = args.credentials?.providerSpecificData?.kiroToolCallRepair !== false &&
+      process.env.KIRO_TOOL_CALL_REPAIR !== "false";
 
-    // Repair is intentionally limited to the pre-output gate. Once a real data
-    // chunk is released, streaming TTFT wins and later invalid wrappers surface
-    // as validation errors instead of replaying behind already-visible output.
+    // Text/reasoning stays private until the AWS stream proves completion with
+    // messageStopEvent. After that proof, the buffered prefix may be released and
+    // trailing usage can continue streaming. The existing size/time guards bound
+    // how much data and time this integrity gate can consume.
     try {
       const firstAttempt = await this.openToolCallRepairGate(firstResult.response, args, {
         signal: combined.signal,
         maxBufferBytes,
         ttftTimeoutMs,
         stallTimeoutMs,
-        suppressInvalidToolCallError: true
+        suppressInvalidToolCallError: true,
+        attempt: "initial"
       });
 
       if (firstAttempt.kind === "stream") {
@@ -536,13 +613,28 @@ export class KiroExecutor extends BaseExecutor {
         return firstResult;
       }
 
+      if (firstAttempt.kind === "invalid" && !toolCallRepairEnabled) {
+        firstResult.response = new Response(formatKiroToolCallRepairError(
+          firstAttempt.invalidToolCall || "Invalid Kiro tool_call payload",
+          "invalid_kiro_tool_call"
+        ), {
+          status: firstResult.response.status,
+          statusText: firstResult.response.statusText,
+          headers: { ...SSE_HEADERS }
+        });
+        return firstResult;
+      }
+
       const repairingEllipsis = firstAttempt.kind === "ellipsis";
+      const repairingMissingTerminal = firstAttempt.kind === "missing_terminal";
       if (repairingEllipsis) {
         console.warn(`[Kiro] Ellipsis-only final response detected for ${args.model}; retrying once`);
       }
-      const repairBody = repairingEllipsis
-        ? buildKiroEllipsisRepairBody(args.body)
-        : buildKiroToolCallRepairBody(args.body, firstAttempt.invalidToolCall);
+      const repairBody = repairingMissingTerminal
+        ? JSON.parse(JSON.stringify(args.body || {}))
+        : repairingEllipsis
+          ? buildKiroEllipsisRepairBody(args.body)
+          : buildKiroToolCallRepairBody(args.body, firstAttempt.invalidToolCall);
       const retryResult = await executeRaw({
         ...args,
         body: repairBody,
@@ -559,7 +651,8 @@ export class KiroExecutor extends BaseExecutor {
         ttftTimeoutMs,
         stallTimeoutMs,
         suppressInvalidToolCallError: false,
-        invalidToolCallErrorCode: "kiro_tool_call_repair_retry_failed"
+        invalidToolCallErrorCode: "kiro_tool_call_repair_retry_failed",
+        attempt: "retry"
       });
 
       if (retryAttempt.kind === "stream") {
@@ -593,6 +686,14 @@ export class KiroExecutor extends BaseExecutor {
         return retryResult;
       }
 
+      if (retryAttempt.kind === "missing_terminal") {
+        retryResult.response = formatKiroMissingTerminalRetryFailure([
+          firstAttempt.terminalDiagnostics,
+          retryAttempt.terminalDiagnostics
+        ].filter(Boolean));
+        return retryResult;
+      }
+
       retryResult.response = new Response(formatKiroToolCallRepairError(
         retryAttempt.kind === "buffer_exceeded"
           ? `Kiro tool_call repair buffer exceeded ${maxBufferBytes} bytes`
@@ -623,9 +724,13 @@ export class KiroExecutor extends BaseExecutor {
 
   async openToolCallRepairGate(rawResponse, args, options) {
     let invalidToolCall = null;
+    let terminalDiagnostics = null;
     const transformed = this.transformEventStreamToSSE(rawResponse, args.model, {
       onInvalidToolCall: (message) => {
         invalidToolCall = message;
+      },
+      onTerminalState: (diagnostics) => {
+        terminalDiagnostics = diagnostics;
       },
       suppressInvalidToolCallError: options.suppressInvalidToolCallError,
       invalidToolCallErrorCode: options.invalidToolCallErrorCode
@@ -655,6 +760,15 @@ export class KiroExecutor extends BaseExecutor {
           if (invalidToolCall) {
             return { kind: "invalid", invalidToolCall };
           }
+          const loggedDiagnostics = logKiroTerminalDiagnostics(
+            args.model,
+            options.attempt,
+            terminalDiagnostics
+          );
+          if (loggedDiagnostics.terminal_provenance === KIRO_TERMINAL_PROVENANCE.UPSTREAM_EOF ||
+              loggedDiagnostics.terminal_provenance === KIRO_TERMINAL_PROVENANCE.MISSING_BODY) {
+            return { kind: "missing_terminal", terminalDiagnostics: loggedDiagnostics };
+          }
           const textOutputs = [outputState.content, outputState.reasoningContent]
             .filter((value) => value.trim() !== "");
           if (!outputState.hasToolCalls && textOutputs.length > 0 && textOutputs.every(isEllipsisOnly)) {
@@ -676,8 +790,27 @@ export class KiroExecutor extends BaseExecutor {
         }
 
         bufferedChunks.push(value);
-        const inspection = inspectRepairSSEChunk(value, outputState);
-        if (inspection.safeToStream) {
+        inspectRepairSSEChunk(value, outputState);
+
+        if (terminalDiagnostics) {
+          const loggedDiagnostics = logKiroTerminalDiagnostics(
+            args.model,
+            options.attempt,
+            terminalDiagnostics
+          );
+          if (loggedDiagnostics.terminal_provenance === KIRO_TERMINAL_PROVENANCE.UPSTREAM_EOF ||
+              loggedDiagnostics.terminal_provenance === KIRO_TERMINAL_PROVENANCE.MISSING_BODY) {
+            await reader.cancel("kiro_missing_terminal").catch(() => {});
+            return { kind: "missing_terminal", terminalDiagnostics: loggedDiagnostics };
+          }
+
+          const textOutputs = [outputState.content, outputState.reasoningContent]
+            .filter((output) => output.trim() !== "");
+          if (!outputState.hasToolCalls && textOutputs.length > 0 && textOutputs.every(isEllipsisOnly)) {
+            await reader.cancel("kiro_ellipsis_retry").catch(() => {});
+            return { kind: "ellipsis" };
+          }
+
           return {
             kind: "stream",
             firstChunk: concatChunks(bufferedChunks, totalBytes),
@@ -713,7 +846,40 @@ export class KiroExecutor extends BaseExecutor {
       generatedToolIdCounter: 0,
       seenToolIds: new Map(),
       pendingWrapperToolCalls: new Map(),
-      inThinking: false
+      inThinking: false,
+      hasTextContent: false,
+      hasCodeContent: false,
+      hasMessageStopEvent: false,
+      terminalReported: false,
+      eventCounts: createKiroEventCounts()
+    };
+
+    const reportTerminalState = (provenance) => {
+      if (state.terminalReported) return;
+      state.terminalReported = true;
+      options.onTerminalState?.({
+        terminal_provenance: provenance,
+        event_counts: { ...state.eventCounts },
+        incomplete_frame_bytes: buffer.byteLength
+      });
+    };
+
+    const emitFinishChunk = (controller, finishReason) => {
+      if (state.finishEmitted) return;
+      state.finishEmitted = true;
+      const finishChunk = {
+        id: responseId,
+        object: "chat.completion.chunk",
+        created,
+        model,
+        choices: [{
+          index: 0,
+          delta: {},
+          finish_reason: finishReason
+        }]
+      };
+      if (state.usage) finishChunk.usage = state.usage;
+      controller.enqueue(encodeSSE(`data: ${JSON.stringify(finishChunk)}\n\n`));
     };
 
     const getToolCallId = (toolUse) => {
@@ -840,6 +1006,7 @@ export class KiroExecutor extends BaseExecutor {
           if (!event) continue;
 
           const eventType = event.headers[":event-type"] || "";
+          incrementKiroEventCount(state.eventCounts, eventType);
 
           // Track total content length for token estimation
           if (!state.totalContentLength) state.totalContentLength = 0;
@@ -878,6 +1045,7 @@ export class KiroExecutor extends BaseExecutor {
             }
 
             state.totalContentLength += content.length;
+            if (content) state.hasTextContent = true;
 
             const chunk = {
               id: responseId,
@@ -933,6 +1101,7 @@ export class KiroExecutor extends BaseExecutor {
 
           // Handle codeEvent
           if (eventType === "codeEvent" && event.payload?.content) {
+            state.hasCodeContent = true;
             const chunk = {
               id: responseId,
               object: "chat.completion.chunk",
@@ -1014,19 +1183,9 @@ export class KiroExecutor extends BaseExecutor {
           // Handle messageStopEvent
           if (eventType === "messageStopEvent") {
             if (!flushPendingWrapperToolCalls(controller)) return;
-            const chunk = {
-              id: responseId,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [{
-                index: 0,
-                delta: {},
-                finish_reason: state.hasToolCalls ? "tool_calls" : "stop"
-              }]
-            };
-            state.finishEmitted = true;
-            controller.enqueue(encodeSSE(`data: ${JSON.stringify(chunk)}\n\n`));
+            state.hasMessageStopEvent = true;
+            reportTerminalState(KIRO_TERMINAL_PROVENANCE.MESSAGE_STOP);
+            emitFinishChunk(controller, state.hasToolCalls ? "tool_calls" : "stop");
           }
 
           // Handle contextUsageEvent to extract contextUsagePercentage
@@ -1092,51 +1251,22 @@ export class KiroExecutor extends BaseExecutor {
             }
           }
 
-          // Emit final chunk only after receiving BOTH meteringEvent AND contextUsageEvent
-          if (state.hasMeteringEvent && state.hasContextUsage && !state.finishEmitted) {
-            if (!flushPendingWrapperToolCalls(controller)) return;
-            state.finishEmitted = true;
-
-            // Estimate tokens if not available from events
-            const hasTokenUsage = Number.isFinite(Number(state.usage?.prompt_tokens)) ||
-              Number.isFinite(Number(state.usage?.completion_tokens));
-            if (!hasTokenUsage) {
-              // Estimate output tokens from content length
-              const estimatedOutputTokens = state.totalContentLength > 0
-                ? Math.max(1, Math.floor(state.totalContentLength / 4))
-                : 0;
-
-              // Estimate input tokens from contextUsagePercentage
-              const estimatedInputTokens = state.contextUsagePercentage > 0
-                ? Math.floor(state.contextUsagePercentage * contextWindow / 100)
-                : 0;
-
-              state.usage = {
-                ...(state.usage || {}),
-                prompt_tokens: estimatedInputTokens,
-                completion_tokens: estimatedOutputTokens,
-                total_tokens: estimatedInputTokens + estimatedOutputTokens
-              };
-            }
-
-            const finishChunk = {
-              id: responseId,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [{
-                index: 0,
-                delta: {},
-                finish_reason: state.hasToolCalls ? "tool_calls" : "stop"
-              }]
+          // contextUsageEvent, meteringEvent, and metricsEvent are usage-only.
+          // They may enrich a proven terminal chunk but can never prove that the
+          // model completed its message.
+          if (state.hasMeteringEvent && state.hasContextUsage && !state.usage?.total_tokens) {
+            const estimatedOutputTokens = state.totalContentLength > 0
+              ? Math.max(1, Math.floor(state.totalContentLength / 4))
+              : 0;
+            const estimatedInputTokens = state.contextUsagePercentage > 0
+              ? Math.floor(state.contextUsagePercentage * contextWindow / 100)
+              : 0;
+            state.usage = {
+              ...(state.usage || {}),
+              prompt_tokens: estimatedInputTokens,
+              completion_tokens: estimatedOutputTokens,
+              total_tokens: estimatedInputTokens + estimatedOutputTokens
             };
-
-            // Include usage in final chunk if available
-            if (state.usage) {
-              finishChunk.usage = state.usage;
-            }
-
-            controller.enqueue(encodeSSE(`data: ${JSON.stringify(finishChunk)}\n\n`));
           }
         }
 
@@ -1153,22 +1283,31 @@ export class KiroExecutor extends BaseExecutor {
 
       const flushOutput = (controller) => {
         if (state.invalidToolCall) return false;
-        if (!flushPendingWrapperToolCalls(controller)) return false;
-        // Emit finish chunk if not already sent
-        if (!state.finishEmitted) {
-          state.finishEmitted = true;
-          const finishChunk = {
-            id: responseId,
-            object: "chat.completion.chunk",
-            created,
-            model,
-            choices: [{
-              index: 0,
-              delta: {},
-              finish_reason: state.hasToolCalls ? "tool_calls" : "stop"
-            }]
-          };
-          controller.enqueue(encodeSSE(`data: ${JSON.stringify(finishChunk)}\n\n`));
+        if (state.hasMessageStopEvent) {
+          if (!flushPendingWrapperToolCalls(controller)) return false;
+        } else {
+          // Compatibility exception: historical Kiro tool-only turns can end at
+          // EOF without messageStopEvent. Keep this narrowly limited to streams
+          // with tool calls and no text, reasoning, or code output.
+          const toolCallOnlyEof = state.hasToolCalls &&
+            !state.hasTextContent &&
+            !state.hasReasoningContent &&
+            !state.hasCodeContent;
+          if (toolCallOnlyEof) {
+            if (!flushPendingWrapperToolCalls(controller)) return false;
+            reportTerminalState(KIRO_TERMINAL_PROVENANCE.TOOL_CALL_EOF);
+            emitFinishChunk(controller, "tool_calls");
+          } else {
+            const diagnostics = {
+              terminal_provenance: KIRO_TERMINAL_PROVENANCE.UPSTREAM_EOF,
+              event_counts: { ...state.eventCounts },
+              incomplete_frame_bytes: buffer.byteLength
+            };
+            reportTerminalState(KIRO_TERMINAL_PROVENANCE.UPSTREAM_EOF);
+            state.doneSent = true;
+            controller.enqueue(formatKiroMissingTerminalSSE(diagnostics));
+            return true;
+          }
         }
 
         // Send final done message
@@ -1177,10 +1316,20 @@ export class KiroExecutor extends BaseExecutor {
           controller.enqueue(encodeSSE(SSE_DONE));
         }
         return true;
-      };
+    };
 
     if (!response.body) {
-      return new Response(SSE_DONE, { status: response.status, headers: { "Content-Type": "text/event-stream" } });
+      const diagnostics = {
+        terminal_provenance: KIRO_TERMINAL_PROVENANCE.MISSING_BODY,
+        event_counts: createKiroEventCounts(),
+        incomplete_frame_bytes: 0
+      };
+      options.onTerminalState?.(diagnostics);
+      return new Response(formatKiroMissingTerminalSSE(diagnostics), {
+        status: response.status,
+        statusText: response.statusText,
+        headers: { ...SSE_HEADERS }
+      });
     }
     let reader;
     const transformedStream = new ReadableStream({

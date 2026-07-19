@@ -62,11 +62,13 @@ describe("KiroExecutor thinking tag stripping", () => {
     // Create frames
     const f1 = createMockFrame("assistantResponseEvent", { content: "Here is my answer. <thinking>Let me think..." });
     const f2 = createMockFrame("assistantResponseEvent", { content: "still thinking...</thinking> Yes, 42." });
+    const f3 = createMockFrame("messageStopEvent", {});
     
     const readableStream = new ReadableStream({
       start(controller) {
         controller.enqueue(f1);
         controller.enqueue(f2);
+        controller.enqueue(f3);
         controller.close();
       }
     });
@@ -105,11 +107,13 @@ describe("KiroExecutor thinking tag stripping", () => {
     
     const f0 = createMockFrame("reasoningContentEvent", { text: "I am reasoning" });
     const f1 = createMockFrame("assistantResponseEvent", { content: "<thinking>purely thinking...</thinking>" });
+    const f2 = createMockFrame("messageStopEvent", {});
     
     const readableStream = new ReadableStream({
       start(controller) {
         controller.enqueue(f0);
         controller.enqueue(f1);
+        controller.enqueue(f2);
         controller.close();
       }
     });

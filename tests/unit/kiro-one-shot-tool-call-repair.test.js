@@ -144,19 +144,27 @@ describe("Kiro one-shot tool_call repair", () => {
     expect(JSON.parse(args)).toEqual({ name: "mcp_search", arguments: { q: "router" } });
   });
 
-  it("preserves happy-path streaming and returns the first chunk before upstream completion", async () => {
+  it("keeps text private until messageStop then releases the buffered prefix", async () => {
     const executor = new KiroExecutor();
     const upstream = controlledEventStreamResponse([
       encodeEventFrame("assistantResponseEvent", { content: "hello" })
     ]);
     fetchMock.mockResolvedValueOnce(upstream.response);
 
-    const result = await executor.execute({
+    let settled = false;
+    const resultPromise = executor.execute({
       model: "kr/claude-opus-4.8",
       body: { conversationState: {} },
       stream: true,
       credentials
     });
+    resultPromise.then(() => { settled = true; });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    upstream.enqueue(encodeEventFrame("messageStopEvent", {}));
+    const result = await resultPromise;
     const reader = result.response.body.getReader();
     const decoder = new TextDecoder();
     const firstRead = await reader.read();
@@ -165,7 +173,6 @@ describe("Kiro one-shot tool_call repair", () => {
     expect(firstRead.done).toBe(false);
     expect(decoder.decode(firstRead.value)).toContain("hello");
 
-    upstream.enqueue(encodeEventFrame("messageStopEvent", {}));
     upstream.close();
     await reader.cancel("test complete").catch(() => {});
   });
@@ -174,8 +181,10 @@ describe("Kiro one-shot tool_call repair", () => {
     const executor = new KiroExecutor();
     let cancelCount = 0;
     let cancelReason;
+    let upstreamController;
     fetchMock.mockResolvedValueOnce(new Response(new ReadableStream({
       start(controller) {
+        upstreamController = controller;
         controller.enqueue(encodeEventFrame("assistantResponseEvent", { content: "hello" }));
       },
       cancel(reason) {
@@ -184,12 +193,15 @@ describe("Kiro one-shot tool_call repair", () => {
       }
     }), { status: 200, statusText: "OK" }));
 
-    const result = await executor.execute({
+    const resultPromise = executor.execute({
       model: "kr/claude-opus-4.8",
       body: { conversationState: {} },
       stream: true,
       credentials
     });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    upstreamController.enqueue(encodeEventFrame("messageStopEvent", {}));
+    const result = await resultPromise;
     const reader = result.response.body.getReader();
     const firstRead = await reader.read();
 
@@ -564,5 +576,165 @@ describe("Kiro one-shot tool_call repair", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(text).not.toContain("kiro_tool_call_repair");
     expect(text).toContain("\"tool_calls\"");
+  });
+
+  describe("Kiro terminal integrity at the live executor seam", () => {
+    it("rejects text plus usage/context events followed by EOF without messageStop", async () => {
+      const executor = new KiroExecutor();
+      const incompleteFrames = [
+        encodeEventFrame("assistantResponseEvent", { content: "I will check the deployment next." }),
+        encodeEventFrame("meteringEvent", { usage: 1, unit: "credit" }),
+        encodeEventFrame("contextUsageEvent", { contextUsagePercentage: 12 })
+      ];
+      fetchMock
+        .mockResolvedValueOnce(eventStreamResponse(incompleteFrames))
+        .mockResolvedValueOnce(eventStreamResponse(incompleteFrames));
+
+      const result = await executor.execute({
+        model: "kr/gpt-5.6-sol",
+        body: { conversationState: {} },
+        stream: true,
+        credentials
+      });
+      const error = await result.response.json();
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.response.status).toBe(502);
+      expect(error.error.code).toBe("kiro_missing_terminal_retry_failed");
+      expect(error.error.details.attempts).toHaveLength(2);
+      expect(error.error.details.attempts[0]).toMatchObject({
+        terminal_provenance: "upstream_eof",
+        event_counts: {
+          assistantResponseEvent: 1,
+          meteringEvent: 1,
+          contextUsageEvent: 1,
+          messageStopEvent: 0
+        }
+      });
+    });
+
+    it("rejects text followed directly by EOF without releasing partial content", async () => {
+      const executor = new KiroExecutor();
+      const incomplete = eventStreamResponse([
+        encodeEventFrame("assistantResponseEvent", { content: "Partial progress that must stay private." })
+      ]);
+      fetchMock
+        .mockResolvedValueOnce(incomplete)
+        .mockResolvedValueOnce(eventStreamResponse([
+          encodeEventFrame("assistantResponseEvent", { content: "Still incomplete." })
+        ]));
+
+      const result = await executor.execute({
+        model: "kr/gpt-5.6-sol",
+        body: { conversationState: {} },
+        stream: true,
+        credentials
+      });
+      const body = await result.response.text();
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.response.status).toBe(502);
+      expect(body).toContain("kiro_missing_terminal_retry_failed");
+      expect(body).not.toContain("Partial progress that must stay private.");
+      expect(body).not.toContain("Still incomplete.");
+    });
+
+    it("accepts text only when a genuine messageStopEvent proves completion", async () => {
+      const executor = new KiroExecutor();
+      fetchMock.mockResolvedValueOnce(eventStreamResponse([
+        encodeEventFrame("assistantResponseEvent", { content: "Complete answer." }),
+        encodeEventFrame("messageStopEvent", {})
+      ]));
+
+      const result = await executor.execute({
+        model: "kr/gpt-5.6-sol",
+        body: { conversationState: {} },
+        stream: true,
+        credentials
+      });
+      const text = await collectText(result.response.body);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(text).toContain("Complete answer.");
+      expect(text).toContain('"finish_reason":"stop"');
+      expect(text).toContain("[DONE]");
+    });
+
+    it("keeps the explicit legacy tool-call-only EOF exception", async () => {
+      const executor = new KiroExecutor();
+      fetchMock.mockResolvedValueOnce(eventStreamResponse([
+        encodeEventFrame("toolUseEvent", {
+          toolUseId: "call_tool_eof",
+          name: "read_file",
+          input: { path: "safe.txt" }
+        })
+      ]));
+
+      const result = await executor.execute({
+        model: "kr/gpt-5.6-sol",
+        body: { conversationState: {} },
+        stream: true,
+        credentials
+      });
+      const text = await collectText(result.response.body);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(text).toContain('"finish_reason":"tool_calls"');
+      expect(text).toContain('"name":"read_file"');
+      expect(text).not.toContain("kiro_missing_terminal");
+    });
+
+    it("retries once and releases only the terminal-proven second attempt", async () => {
+      const executor = new KiroExecutor();
+      fetchMock
+        .mockResolvedValueOnce(eventStreamResponse([
+          encodeEventFrame("assistantResponseEvent", { content: "Unproven partial." }),
+          encodeEventFrame("metricsEvent", { inputTokens: 10, outputTokens: 3 })
+        ]))
+        .mockResolvedValueOnce(eventStreamResponse([
+          encodeEventFrame("assistantResponseEvent", { content: "Recovered complete answer." }),
+          encodeEventFrame("messageStopEvent", {})
+        ]));
+
+      const result = await executor.execute({
+        model: "kr/gpt-5.6-sol",
+        body: { conversationState: {} },
+        stream: true,
+        credentials
+      });
+      const text = await collectText(result.response.body);
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.response.status).toBe(200);
+      expect(text).toContain("Recovered complete answer.");
+      expect(text).not.toContain("Unproven partial.");
+      expect(text).toContain('"finish_reason":"stop"');
+    });
+
+    it("bounds missing-terminal repair to one retry and returns fallback-compatible 502", async () => {
+      const executor = new KiroExecutor();
+      fetchMock
+        .mockResolvedValueOnce(eventStreamResponse([
+          encodeEventFrame("reasoningContentEvent", { content: "First unproven reasoning." })
+        ]))
+        .mockResolvedValueOnce(eventStreamResponse([
+          encodeEventFrame("assistantResponseEvent", { content: "Second unproven answer." })
+        ]));
+
+      const result = await executor.execute({
+        model: "kr/gpt-5.6-sol",
+        body: { conversationState: {} },
+        stream: true,
+        credentials
+      });
+      const body = await result.response.text();
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(result.response.status).toBe(502);
+      expect(result.response.headers.get("content-type")).toContain("application/json");
+      expect(body).toContain("kiro_missing_terminal_retry_failed");
+      expect(body).not.toContain("First unproven reasoning.");
+      expect(body).not.toContain("Second unproven answer.");
+    });
   });
 });
