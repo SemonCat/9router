@@ -55,6 +55,10 @@ function formatTranslatedStreamError(error, sourceFormat, responsesAccumulator =
     return `${failed}data: [DONE]\n\n`;
   }
 
+  if (sourceFormat === FORMATS.OPENAI) {
+    return `data: ${JSON.stringify({ error: normalized })}\n\ndata: [DONE]\n\n`;
+  }
+
   if (sourceFormat === FORMATS.CLAUDE) {
     return `event: error\ndata: ${JSON.stringify({ type: "error", error: normalized })}\n\n`;
   }
@@ -67,7 +71,7 @@ function formatTranslatedStreamError(error, sourceFormat, responsesAccumulator =
     return `${JSON.stringify({ error: normalized.message })}\n`;
   }
 
-  return `data: ${JSON.stringify({ error: normalized })}\n\ndata: [DONE]\n\n`;
+  return `data: ${JSON.stringify({ error: normalized })}\n\n`;
 }
 
 /**
@@ -126,7 +130,7 @@ export function createSSEStream(options = {}) {
     (targetFormat === FORMATS.OPENAI_RESPONSES || sourceFormat === FORMATS.OPENAI_RESPONSES
       ? createResponsesAccumulator({ model })
       : null);
-  if (state && openAIResponsesAccumulator && targetFormat === FORMATS.OPENAI_RESPONSES) {
+  if (state && openAIResponsesAccumulator) {
     state.responsesAccumulator = openAIResponsesAccumulator;
   }
   const reduceOpenAIResponsesOutput = (item) => {

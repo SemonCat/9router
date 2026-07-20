@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { passthroughMock, translateMock } = vi.hoisted(() => ({
+const { passthroughMock, pipeMock, translateMock } = vi.hoisted(() => ({
   passthroughMock: vi.fn(() => new TransformStream()),
+  pipeMock: vi.fn(providerResponse => providerResponse.body),
   translateMock: vi.fn(() => new TransformStream())
 }));
 
@@ -12,7 +13,7 @@ vi.mock("../../open-sse/utils/stream.js", () => ({
 }));
 
 vi.mock("../../open-sse/utils/streamHandler.js", () => ({
-  pipeWithDisconnect: vi.fn(providerResponse => providerResponse.body)
+  pipeWithDisconnect: pipeMock
 }));
 
 vi.mock("@/lib/usageDb.js", () => ({
@@ -22,6 +23,7 @@ vi.mock("@/lib/usageDb.js", () => ({
 }));
 
 const { FORMATS } = await import("../../open-sse/translator/formats.js");
+const { reduceResponsesEvent } = await import("../../open-sse/translator/concerns/responsesAccumulator.js");
 const { handleStreamingResponse } = await import("../../open-sse/handlers/chatCore/streamingHandler.js");
 
 function responsesProviderResponse() {
@@ -59,8 +61,24 @@ describe("Responses streaming handler CLI passthrough", () => {
 
       expect(result.success).toBe(true);
       expect(passthroughMock).toHaveBeenCalledOnce();
-      expect(passthroughMock.mock.calls[0][7]).toEqual(expect.objectContaining({ model: "gpt-5.3-codex" }));
+      const accumulator = passthroughMock.mock.calls[0][7];
+      expect(accumulator).toEqual(expect.objectContaining({ model: "gpt-5.3-codex" }));
       expect(translateMock).not.toHaveBeenCalled();
+
+      reduceResponsesEvent(accumulator, {
+        type: "response.created",
+        response: { id: "resp_handler_passthrough", status: "in_progress", output: [] }
+      });
+      reduceResponsesEvent(accumulator, {
+        type: "response.output_text.delta",
+        output_index: 0,
+        item_id: "msg_handler_passthrough",
+        delta: "partial from raw passthrough"
+      });
+      const abortTerminal = pipeMock.mock.calls[0][3]();
+      const terminalText = new TextDecoder().decode(abortTerminal);
+      expect(terminalText).toContain('"id":"resp_handler_passthrough"');
+      expect(terminalText).toContain('"text":"partial from raw passthrough"');
     }
   );
 

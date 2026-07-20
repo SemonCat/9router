@@ -249,20 +249,22 @@ describe("Kiro nested tool_call validation", () => {
     await writer.close();
 
     const text = await readPromise;
+    const events = collectDataChunks(text);
+    const created = events.find(event => event.type === "response.created");
+    const failed = events.find(event => event.type === "response.failed");
 
     expect(text).toContain("event: response.failed");
     expect(text).toContain("invalid_kiro_tool_call");
     expect(text).toContain("missing nested MCP tool name");
-    expect(text).toContain('"text":"partial before failure"');
     expect(text).toContain("response.output_item.added");
     expect(text).toContain("data: [DONE]");
+    expect(failed.response.id).toBe(created.response.id);
+    expect(failed.response.id).toBe("resp_chatcmpl_partial");
+    expect(failed.response.output[0].content[0].text).toBe("partial before failure");
+    expect(text).not.toContain("resp_error_");
   });
 
-  it.each([
-    [FORMATS.CLAUDE, "event: error", "data: [DONE]"],
-    [FORMATS.ANTIGRAVITY, 'data: {"error":', "data: [DONE]"],
-    [FORMATS.OLLAMA, '{"error":"upstream failed"}', "data:"]
-  ])("uses %s-native framing for translated stream errors", async (sourceFormat, expected, forbidden) => {
+  async function translateStreamError(sourceFormat) {
     const transform = createSSETransformStreamWithLogger(
       FORMATS.KIRO,
       sourceFormat,
@@ -278,9 +280,45 @@ describe("Kiro nested tool_call validation", () => {
     ));
     await writer.close();
 
-    const text = await readPromise;
-    expect(text).toContain(expected);
-    expect(text).not.toContain(forbidden);
+    return readPromise;
+  }
+
+  it("uses OpenAI-compatible SSE framing for translated stream errors", async () => {
+    const text = await translateStreamError(FORMATS.OPENAI);
+    const payload = collectDataChunks(text)[0];
+
+    expect(payload.error.message).toBe("upstream failed");
+    expect(text).toContain("data: [DONE]");
+  });
+
+  it("uses Claude error events without the OpenAI sentinel", async () => {
+    const text = await translateStreamError(FORMATS.CLAUDE);
+
+    expect(text).toContain("event: error");
+    expect(text).toContain('data: {"type":"error"');
+    expect(text).not.toContain("data: [DONE]");
+  });
+
+  it.each([
+    FORMATS.GEMINI,
+    FORMATS.GEMINI_CLI,
+    FORMATS.VERTEX,
+    FORMATS.ANTIGRAVITY
+  ])("uses %s SSE error data without the OpenAI sentinel", async sourceFormat => {
+    const text = await translateStreamError(sourceFormat);
+    const payload = collectDataChunks(text)[0];
+
+    expect(payload.error.message).toBe("upstream failed");
+    expect(text).not.toContain("data: [DONE]");
+  });
+
+  it("uses valid Ollama NDJSON for translated stream errors", async () => {
+    const text = await translateStreamError(FORMATS.OLLAMA);
+    const lines = text.trim().split("\n");
+
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0])).toEqual({ error: "upstream failed" });
+    expect(text).not.toContain("data:");
   });
 
   it("does not change non-Kiro OpenAI function_call translation", () => {
