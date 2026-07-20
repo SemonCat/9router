@@ -1,8 +1,8 @@
 # Local patch stack
 
 `local-patches` is the maintainable source branch for the personal AWS patch
-stack. It is based on `upstream/master` at
-`0513bf393fb0eedd2baecdadb54b6129976a706c` (2026-07-20).
+stack. It is currently merged with `upstream/master` at
+`79918c7830695bbca4a45c9fea4a42c3e9fd73d1` (v0.5.40, 2026-07-20).
 
 This branch is **not auto-deployed**. Committing or pushing it does not update
 AWS; deployment remains a separate, explicit operation.
@@ -114,8 +114,8 @@ npx vitest run --config tests/vitest.config.js \
   tests/unit/openai-to-kiro.test.js \
   tests/translator/claude-kiro-direct.test.js \
   tests/unit/kiro-tool-call-validation.test.js \
-  tests/unit/kiro-one-shot-tool-call-repair.test.js \
   tests/unit/kiro-thinking-strip.test.js \
+  tests/unit/kiro-terminal-integrity.test.js \
   tests/unit/responses-accumulator.test.js \
   tests/unit/forced-responses-sse-to-json.test.js \
   tests/unit/openai-responses-terminal-event.test.js \

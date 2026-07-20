@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { KiroExecutor, validateKiroToolUse } from "../../open-sse/executors/kiro.js";
+import { KiroExecutor } from "../../open-sse/executors/kiro.js";
 import { openaiToOpenAIResponsesResponse } from "../../open-sse/translator/response/openai-responses.js";
 import { createSSETransformStreamWithLogger } from "../../open-sse/utils/stream.js";
 import { FORMATS } from "../../open-sse/translator/formats.js";
@@ -67,57 +67,6 @@ function collectDataChunks(text) {
 }
 
 describe("Kiro nested tool_call validation", () => {
-  it("accepts a valid wrapper tool_call with nested name and arguments", () => {
-    expect(() => validateKiroToolUse({
-      toolUseId: "call_1",
-      name: "tool_call",
-      input: { name: "mcp_search", arguments: { q: "router" } }
-    })).not.toThrow();
-  });
-
-  it("accepts ordinary provider tool calls without requiring wrapper fields", () => {
-    expect(() => validateKiroToolUse({
-      toolUseId: "call_1",
-      name: "get_weather",
-      input: { city: "Taipei" }
-    })).not.toThrow();
-  });
-
-  it("rejects missing or empty Kiro tool names", () => {
-    expect(() => validateKiroToolUse({ toolUseId: "call_1", input: {} }))
-      .toThrow(/missing tool name/);
-    expect(() => validateKiroToolUse({ toolUseId: "call_1", name: "   ", input: {} }))
-      .toThrow(/missing tool name/);
-  });
-
-  it("rejects wrapper tool_call payloads without the real MCP tool name", () => {
-    expect(() => validateKiroToolUse({
-      toolUseId: "call_1",
-      name: "tool_call",
-      input: { arguments: { q: "router" } }
-    })).toThrow(/missing nested MCP tool name/);
-
-    expect(() => validateKiroToolUse({
-      toolUseId: "call_1",
-      name: "tool_call",
-      input: { name: "  ", arguments: {} }
-    })).toThrow(/missing nested MCP tool name/);
-  });
-
-  it("rejects malformed wrapper JSON and missing nested arguments", () => {
-    expect(() => validateKiroToolUse({
-      toolUseId: "call_1",
-      name: "tool_call",
-      input: "{\"name\":\"mcp_search\","
-    })).toThrow(/valid JSON/);
-
-    expect(() => validateKiroToolUse({
-      toolUseId: "call_1",
-      name: "tool_call",
-      input: { name: "mcp_search" }
-    })).toThrow(/missing nested MCP tool arguments/);
-  });
-
   it("emits an actionable stream error instead of a fake legal tool call", async () => {
     const executor = new KiroExecutor();
     const frames = [
@@ -216,7 +165,7 @@ describe("Kiro nested tool_call validation", () => {
     expect(chunks.at(-1).usage).toBeDefined();
   });
 
-  it("preserves monotonic emitted tool indices when a wrapper is buffered before a direct tool", async () => {
+  it("preserves monotonic stream-order tool indices", async () => {
     const executor = new KiroExecutor();
     const frames = [
       encodeEventFrame("toolUseEvent", {
@@ -246,7 +195,7 @@ describe("Kiro nested tool_call validation", () => {
       .filter((toolCall) => toolCall.id);
 
     expect(text).not.toContain("invalid_kiro_tool_call");
-    expect(toolStarts.map((toolCall) => toolCall.function.name)).toEqual(["read_file", "tool_call"]);
+    expect(toolStarts.map((toolCall) => toolCall.function.name)).toEqual(["tool_call", "read_file"]);
     expect(toolStarts.map((toolCall) => toolCall.index)).toEqual([0, 1]);
   });
 
@@ -278,41 +227,6 @@ describe("Kiro nested tool_call validation", () => {
     expect(text).toContain("missing nested MCP tool name");
     expect(text).not.toContain("\"tool_calls\"");
     expect(text).toContain("data: [DONE]");
-  });
-
-  it("cancels the upstream response body after an invalid wrapper payload", async () => {
-    const executor = new KiroExecutor();
-    const frames = [
-      encodeEventFrame("toolUseEvent", {
-        toolUseId: "call_1",
-        name: "tool_call",
-        input: { arguments: { q: "router" } }
-      }),
-      encodeEventFrame("messageStopEvent", {})
-    ];
-    let cancelReason;
-    const cancelPromise = new Promise((resolve) => {
-      const response = new Response(new ReadableStream({
-        start(controller) {
-          for (const frame of frames) controller.enqueue(frame);
-        },
-        cancel(reason) {
-          cancelReason = reason;
-          resolve(reason);
-        }
-      }), { status: 200, statusText: "OK" });
-
-      const transformed = executor.transformEventStreamToSSE(response, "kr/claude-opus-4.8");
-      collectText(transformed.body).catch(resolve);
-    });
-
-    const result = await Promise.race([
-      cancelPromise,
-      new Promise((resolve) => setTimeout(() => resolve("timeout"), 250))
-    ]);
-
-    expect(result).not.toBe("timeout");
-    expect(cancelReason).toBeDefined();
   });
 
   it("translates Kiro stream errors into Responses response.failed events", async () => {

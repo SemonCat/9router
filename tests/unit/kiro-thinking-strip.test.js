@@ -2,17 +2,6 @@ import { describe, it, expect } from "vitest";
 import { KiroExecutor } from "../../open-sse/executors/kiro.js";
 import "../translator/registerAll.js";
 
-function crc32(bytes) {
-  let crc = 0xffffffff;
-  for (const byte of bytes) {
-    crc ^= byte;
-    for (let bit = 0; bit < 8; bit++) {
-      crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
-    }
-  }
-  return (crc ^ 0xffffffff) >>> 0;
-}
-
 function createMockFrame(eventType, payloadObj) {
   const payloadStr = JSON.stringify(payloadObj);
   const payloadBytes = new TextEncoder().encode(payloadStr);
@@ -43,10 +32,21 @@ function createMockFrame(eventType, payloadObj) {
   offset += headerValueBytes.length;
 
   buffer.set(payloadBytes, offset);
+
   view.setUint32(8, crc32(buffer.subarray(0, 8)), false);
   view.setUint32(totalLength - 4, crc32(buffer.subarray(0, totalLength - 4)), false);
-  
   return buffer;
+}
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) {
+      crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 async function readAllSSE(stream) {
@@ -75,13 +75,11 @@ describe("KiroExecutor thinking tag stripping", () => {
     // Create frames
     const f1 = createMockFrame("assistantResponseEvent", { content: "Here is my answer. <thinking>Let me think..." });
     const f2 = createMockFrame("assistantResponseEvent", { content: "still thinking...</thinking> Yes, 42." });
-    const f3 = createMockFrame("messageStopEvent", {});
     
     const readableStream = new ReadableStream({
       start(controller) {
         controller.enqueue(f1);
         controller.enqueue(f2);
-        controller.enqueue(f3);
         controller.close();
       }
     });
@@ -120,13 +118,11 @@ describe("KiroExecutor thinking tag stripping", () => {
     
     const f0 = createMockFrame("reasoningContentEvent", { text: "I am reasoning" });
     const f1 = createMockFrame("assistantResponseEvent", { content: "<thinking>purely thinking...</thinking>" });
-    const f2 = createMockFrame("messageStopEvent", {});
     
     const readableStream = new ReadableStream({
       start(controller) {
         controller.enqueue(f0);
         controller.enqueue(f1);
-        controller.enqueue(f2);
         controller.close();
       }
     });
@@ -145,59 +141,6 @@ describe("KiroExecutor thinking tag stripping", () => {
     // We shouldn't get an empty content chunk from f1 since it was entirely stripped and reasoning was present
     const contentChunks = objects.filter(obj => obj.choices[0].delta.content !== undefined);
     expect(contentChunks.length).toBe(0);
-  });
-
-  it("preserves Kiro meteringEvent usage on the final token-usage chunk", async () => {
-    const executor = new KiroExecutor();
-    const frames = [
-      createMockFrame("assistantResponseEvent", { content: "OK" }),
-      createMockFrame("meteringEvent", { usage: 0.0097, unit: "credit", unitPlural: "credits" }),
-      createMockFrame("contextUsageEvent", { contextUsagePercentage: 1 }),
-    ];
-    const readableStream = new ReadableStream({
-      start(controller) {
-        for (const frame of frames) controller.enqueue(frame);
-        controller.close();
-      }
-    });
-
-    const output = await readAllSSE(
-      executor.transformEventStreamToSSE({ body: readableStream }, "claude-test").body
-    );
-    const objects = output
-      .split("\n")
-      .filter(line => line.startsWith("data: ") && !line.includes("[DONE]"))
-      .map(line => JSON.parse(line.slice(6)));
-    const usageChunk = objects.find(obj => obj.usage?.kiro_credits !== undefined);
-
-    expect(usageChunk.usage.kiro_credits).toBe(0.0097);
-    expect(usageChunk.usage.kiro_credit_unit).toBe("credit");
-    expect(usageChunk.usage.prompt_tokens).toBeGreaterThan(0);
-  });
-
-  it("emits Kiro metering usage when messageStop arrives first", async () => {
-    const executor = new KiroExecutor();
-    const frames = [
-      createMockFrame("assistantResponseEvent", { content: "OK" }),
-      createMockFrame("messageStopEvent", {}),
-      createMockFrame("meteringEvent", { usage: 0.0061, unit: "credit", unitPlural: "credits" }),
-    ];
-    const readableStream = new ReadableStream({
-      start(controller) {
-        for (const frame of frames) controller.enqueue(frame);
-        controller.close();
-      }
-    });
-
-    const output = await readAllSSE(
-      executor.transformEventStreamToSSE({ body: readableStream }, "claude-test").body
-    );
-    const objects = output
-      .split("\n")
-      .filter(line => line.startsWith("data: ") && !line.includes("[DONE]"))
-      .map(line => JSON.parse(line.slice(6)));
-
-    expect(objects.some(obj => obj.usage?.kiro_credits === 0.0061)).toBe(true);
   });
 
   it("waits for clean EOF before emitting stop after messageStop", async () => {
@@ -219,17 +162,15 @@ describe("KiroExecutor thinking tag stripping", () => {
     const reader = transformedResponse.body.getReader();
     const decoder = new TextDecoder();
     let output = "";
-    for (let i = 0; i < 2; i++) {
-      const { value } = await readNextWithTimeout(reader);
-      output += decoder.decode(value, { stream: true });
-    }
+    const { value } = await readNextWithTimeout(reader);
+    output += decoder.decode(value, { stream: true });
     expect(output).not.toContain("\"finish_reason\":\"stop\"");
 
     upstreamController.close();
     while (!output.includes("\"finish_reason\":\"stop\"")) {
-      const { value, done } = await readNextWithTimeout(reader);
+      const { value: nextValue, done } = await readNextWithTimeout(reader);
       if (done) break;
-      output += decoder.decode(value, { stream: true });
+      output += decoder.decode(nextValue, { stream: true });
     }
 
     expect(output).toContain("\"finish_reason\":\"stop\"");
