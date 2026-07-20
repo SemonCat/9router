@@ -141,6 +141,24 @@ export function createSSEStream(options = {}) {
     }
     return reduced;
   };
+  const finishOpenAIResponsesPassthrough = (controller) => {
+    if (!openAIResponsesTerminalSeen) {
+      const failedOutput = formatIncompleteOpenAIResponsesStreamFailure(openAIResponsesAccumulator);
+      if (failedOutput) {
+        reqLogger?.appendConvertedChunk?.(failedOutput);
+        controller.enqueue(sharedEncoder.encode(failedOutput));
+      }
+      openAIResponsesTerminalSeen = true;
+    }
+    if (!streamDoneSent) {
+      const doneOutput = "data: [DONE]\n\n";
+      reqLogger?.appendConvertedChunk?.(doneOutput);
+      controller.enqueue(sharedEncoder.encode(doneOutput));
+      streamDoneSent = true;
+      openAIResponsesDoneSent = true;
+      openAIResponsesAccumulator.doneSent = true;
+    }
+  };
 
   const transformStream = new TransformStream({
     transform(chunk, controller) {
@@ -169,6 +187,13 @@ export function createSSEStream(options = {}) {
 
         // Passthrough mode: normalize and forward
         if (mode === STREAM_MODE.PASSTHROUGH) {
+          const outputsOpenAIResponses = Boolean(openAIResponsesAccumulator);
+          const isDoneSentinel = trimmed.startsWith("data:") && trimmed.slice(5).trim() === "[DONE]";
+          if (outputsOpenAIResponses && isDoneSentinel) {
+            finishOpenAIResponsesPassthrough(controller);
+            continue;
+          }
+
           let output;
           let injectedUsage = false;
 
@@ -451,6 +476,38 @@ export function createSSEStream(options = {}) {
         if (remaining) buffer += remaining;
 
         if (mode === STREAM_MODE.PASSTHROUGH) {
+          const outputsOpenAIResponses = Boolean(openAIResponsesAccumulator);
+          if (outputsOpenAIResponses && buffer.trim()) {
+            const trimmed = buffer.trim();
+            if (trimmed.startsWith("event:")) {
+              currentOpenAIResponsesEvent = trimmed.slice(6).trim();
+            } else if (trimmed.startsWith("data:")) {
+              const dataValue = trimmed.slice(5).trim();
+              if (dataValue === "[DONE]") {
+                finishOpenAIResponsesPassthrough(controller);
+                buffer = "";
+              } else {
+                try {
+                  const parsed = JSON.parse(dataValue);
+                  const eventName = getOpenAIResponsesEventName(currentOpenAIResponsesEvent, parsed);
+                  reduceOpenAIResponsesOutput({ event: eventName, data: parsed });
+                  currentOpenAIResponsesEvent = null;
+                } catch {
+                  // Preserve the existing passthrough behavior for malformed final lines.
+                }
+              }
+            }
+
+            if (buffer) {
+              const output = `${trimmed.startsWith("data:") && !trimmed.startsWith("data: ")
+                ? `data: ${trimmed.slice(5)}`
+                : trimmed}\n\n`;
+              reqLogger?.appendConvertedChunk?.(output);
+              controller.enqueue(sharedEncoder.encode(output));
+              buffer = "";
+            }
+          }
+
           if (buffer) {
             let output = buffer;
             if (buffer.startsWith("data:") && !buffer.startsWith("data: ")) {
@@ -476,10 +533,13 @@ export function createSSEStream(options = {}) {
           // Without it they can hang until timeout and trigger failover.
           // Gemini-family clients (Antigravity, Vertex, Gemini) reject this sentinel with 400 syntax errors.
           const isGeminiFamily = provider === "antigravity" || provider === "gemini" || provider === "vertex";
-          if (!streamDoneSent && !isGeminiFamily) {
+          if (outputsOpenAIResponses) {
+            finishOpenAIResponsesPassthrough(controller);
+          } else if (!streamDoneSent && !isGeminiFamily) {
             const doneOutput = "data: [DONE]\n\n";
             reqLogger?.appendConvertedChunk?.(doneOutput);
             controller.enqueue(sharedEncoder.encode(doneOutput));
+            streamDoneSent = true;
           }
 
           if (onStreamComplete) {

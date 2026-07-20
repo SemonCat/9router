@@ -109,6 +109,32 @@ function collectChat(events) {
 }
 
 describe("Responses accumulator P0 reconstruction", () => {
+  it("omits argument-only tool calls that never receive executable metadata", () => {
+    const accumulator = createResponsesAccumulator({ id: "resp_missing_tool_metadata" });
+    reduceResponsesEvent(accumulator, event("response.output_text.delta", {
+      output_index: 0,
+      item_id: "msg_partial",
+      delta: "partial text"
+    }));
+    reduceResponsesEvent(accumulator, event("response.function_call_arguments.delta", {
+      output_index: 1,
+      item_id: "fc_missing_metadata",
+      delta: "{\"partial\":"
+    }));
+
+    finalizeResponsesAccumulator(accumulator, {
+      eventType: "response.failed",
+      error: { type: "stream_error", code: "stream_disconnected", message: "stream disconnected" }
+    });
+
+    expect(accumulator.terminalResponse.output).toEqual([
+      expect.objectContaining({
+        type: "message",
+        content: [{ type: "output_text", text: "partial text" }]
+      })
+    ]);
+  });
+
   it("correlates interleaved tools and arguments that arrive before metadata", () => {
     const { accumulator } = reduceAll(p0Events());
 

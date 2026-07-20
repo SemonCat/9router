@@ -1,4 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("@/lib/usageDb.js", () => ({
+  appendRequestLog: vi.fn(async () => {}),
+  saveRequestDetail: vi.fn(async () => {}),
+  saveRequestUsage: vi.fn(async () => {}),
+  trackPendingRequest: vi.fn()
+}));
 
 import { createDisconnectAwareStream } from "../../open-sse/utils/streamHandler.js";
 import { buildAbortedResponsesTerminalBytes } from "../../open-sse/utils/responsesStreamHelpers.js";
@@ -162,6 +169,147 @@ describe("Responses abort terminal synthesis", () => {
     expect(text).toContain('"id":"resp_passthrough"');
     expect(text).toContain('"text":"partial passthrough"');
     expect(text.match(/event: response\.failed/g)).toHaveLength(1);
+  });
+
+  it("fails raw Responses passthrough when clean EOF arrives without a terminal", async () => {
+    const accumulator = createResponsesAccumulator({ model: "gpt-passthrough" });
+    const transform = createPassthroughStreamWithLogger(
+      "codex",
+      null,
+      "gpt-passthrough",
+      null,
+      null,
+      null,
+      null,
+      accumulator
+    );
+    const payload = [
+      "event: response.created",
+      `data: ${JSON.stringify({
+        type: "response.created",
+        response: { id: "resp_clean_eof", status: "in_progress", output: [] }
+      })}`,
+      "",
+      "event: response.output_text.delta",
+      `data: ${JSON.stringify({
+        type: "response.output_text.delta",
+        output_index: 0,
+        item_id: "msg_clean_eof",
+        delta: "partial before clean eof"
+      })}`,
+      "",
+      ""
+    ].join("\n");
+    const upstream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(payload));
+        controller.close();
+      }
+    }).pipeThrough(transform);
+
+    const text = await readAll(upstream);
+    expect(text).toContain("event: response.failed");
+    expect(text).toContain('"id":"resp_clean_eof"');
+    expect(text).toContain('"text":"partial before clean eof"');
+    expect(text.match(/event: response\.failed/g)).toHaveLength(1);
+    expect(text.match(/data: \[DONE\]/g)).toHaveLength(1);
+    expect(accumulator.doneSent).toBe(true);
+  });
+
+  it.each(["data: [DONE]", "data:[DONE]"])(
+    "emits failure before a raw Responses %s sentinel when no terminal arrived",
+    async doneSentinel => {
+      const accumulator = createResponsesAccumulator({ model: "gpt-passthrough" });
+      const transform = createPassthroughStreamWithLogger(
+        "codex",
+        null,
+        "gpt-passthrough",
+        null,
+        null,
+        null,
+        null,
+        accumulator
+      );
+      const payload = [
+        "event: response.created",
+        `data: ${JSON.stringify({
+          type: "response.created",
+          response: { id: "resp_done_without_terminal", status: "in_progress", output: [] }
+        })}`,
+        "",
+        doneSentinel,
+        "",
+        ""
+      ].join("\n");
+      const upstream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(payload));
+          controller.close();
+        }
+      }).pipeThrough(transform);
+
+      const text = await readAll(upstream);
+      expect(text.indexOf("event: response.failed")).toBeLessThan(text.indexOf("data: [DONE]"));
+      expect(text.match(/event: response\.failed/g)).toHaveLength(1);
+      expect(text.match(/data: \[DONE\]/g)).toHaveLength(1);
+    }
+  );
+
+  it("accepts a final unterminated Responses terminal line", async () => {
+    const accumulator = createResponsesAccumulator({ model: "gpt-passthrough" });
+    const transform = createPassthroughStreamWithLogger(
+      "codex",
+      null,
+      "gpt-passthrough",
+      null,
+      null,
+      null,
+      null,
+      accumulator
+    );
+    const payload = [
+      "event: response.completed",
+      `data: ${JSON.stringify({
+        type: "response.completed",
+        response: { id: "resp_unterminated_terminal", status: "completed", output: [] }
+      })}`
+    ].join("\n");
+    const upstream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(payload));
+        controller.close();
+      }
+    }).pipeThrough(transform);
+
+    const text = await readAll(upstream);
+    expect(text).toContain("event: response.completed");
+    expect(text).not.toContain("event: response.failed");
+    expect(text.match(/data: \[DONE\]/g)).toHaveLength(1);
+  });
+
+  it("fails before an unterminated no-space DONE sentinel", async () => {
+    const accumulator = createResponsesAccumulator({ id: "resp_unterminated_done" });
+    const transform = createPassthroughStreamWithLogger(
+      "codex",
+      null,
+      "gpt-passthrough",
+      null,
+      null,
+      null,
+      null,
+      accumulator
+    );
+    const upstream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("data:[DONE]"));
+        controller.close();
+      }
+    }).pipeThrough(transform);
+
+    const text = await readAll(upstream);
+    expect(text.indexOf("event: response.failed")).toBeLessThan(text.indexOf("data: [DONE]"));
+    expect(text.match(/event: response\.failed/g)).toHaveLength(1);
+    expect(text.match(/data: \[DONE\]/g)).toHaveLength(1);
   });
 
   it("emits only DONE when abort follows an accepted Responses terminal", () => {

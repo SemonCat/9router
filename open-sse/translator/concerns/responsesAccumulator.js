@@ -396,7 +396,9 @@ export function createResponsesAccumulator({ id = "", createdAt = 0, model = "" 
 
 export function buildResponsesOutput(state, terminalStatus = null) {
   if (!state) return [];
-  return sortedItems(state).map(item => buildItem(item, terminalStatus));
+  return sortedItems(state)
+    .filter(item => !TOOL_ITEM_TYPES.has(item.type) || Boolean(item.name || item.raw?.name))
+    .map(item => buildItem(item, terminalStatus));
 }
 
 export function getResponsesItems(state, type = null) {
