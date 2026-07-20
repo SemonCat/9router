@@ -59,6 +59,7 @@ describe("Responses streaming handler CLI passthrough", () => {
 
       expect(result.success).toBe(true);
       expect(passthroughMock).toHaveBeenCalledOnce();
+      expect(passthroughMock.mock.calls[0][7]).toEqual(expect.objectContaining({ model: "gpt-5.3-codex" }));
       expect(translateMock).not.toHaveBeenCalled();
     }
   );

@@ -3,7 +3,12 @@ import { FORMATS } from "../translator/formats.js";
 import { trackPendingRequest, appendRequestLog } from "@/lib/usageDb.js";
 import { extractUsage, mergeUsage, hasValidUsage, estimateUsage, logUsage, addBufferToUsage, filterUsageForFormat, COLORS } from "./usageTracking.js";
 import { parseSSELine, hasValuableContent, fixInvalidId, formatSSE } from "./streamHelpers.js";
-import { getOpenAIResponsesEventName, isOpenAIResponsesTerminalEvent, formatIncompleteOpenAIResponsesStreamFailure } from "./responsesStreamHelpers.js";
+import {
+  getOpenAIResponsesEventName,
+  isOpenAIResponsesTerminalEvent,
+  formatIncompleteOpenAIResponsesStreamFailure,
+  formatOpenAIResponsesStreamFailure
+} from "./responsesStreamHelpers.js";
 import {
   createResponsesAccumulator,
   reduceResponsesEvent
@@ -41,29 +46,25 @@ function normalizeStreamError(error) {
   };
 }
 
-function formatTranslatedStreamError(error, sourceFormat) {
+function formatTranslatedStreamError(error, sourceFormat, responsesAccumulator = null) {
   const normalized = normalizeStreamError(error);
 
   if (sourceFormat === FORMATS.OPENAI_RESPONSES) {
-    const now = Math.floor(Date.now() / 1000);
-    const failed = {
-      type: "response.failed",
-      response: {
-        id: `resp_error_${Date.now()}`,
-        object: "response",
-        created_at: now,
-        status: "failed",
-        background: false,
-        error: normalized,
-        output: []
-      },
-      sequence_number: 0
-    };
-    return `event: response.failed\ndata: ${JSON.stringify(failed)}\n\ndata: [DONE]\n\n`;
+    const failed = formatOpenAIResponsesStreamFailure(responsesAccumulator, normalized);
+    if (responsesAccumulator) responsesAccumulator.doneSent = true;
+    return `${failed}data: [DONE]\n\n`;
   }
 
   if (sourceFormat === FORMATS.CLAUDE) {
-    return `event: error\ndata: ${JSON.stringify({ type: "error", error: normalized })}\n\ndata: [DONE]\n\n`;
+    return `event: error\ndata: ${JSON.stringify({ type: "error", error: normalized })}\n\n`;
+  }
+
+  if ([FORMATS.GEMINI, FORMATS.GEMINI_CLI, FORMATS.VERTEX, FORMATS.ANTIGRAVITY].includes(sourceFormat)) {
+    return `data: ${JSON.stringify({ error: normalized })}\n\n`;
+  }
+
+  if (sourceFormat === FORMATS.OLLAMA) {
+    return `${JSON.stringify({ error: normalized.message })}\n`;
   }
 
   return `data: ${JSON.stringify({ error: normalized })}\n\ndata: [DONE]\n\n`;
@@ -122,12 +123,20 @@ export function createSSEStream(options = {}) {
   let streamDoneSent = false;  // track duplicate [DONE] across transform + flush
   let upstreamErrorForwarded = false;
   const openAIResponsesAccumulator = responsesAccumulator ||
-    (targetFormat === FORMATS.OPENAI_RESPONSES
+    (targetFormat === FORMATS.OPENAI_RESPONSES || sourceFormat === FORMATS.OPENAI_RESPONSES
       ? createResponsesAccumulator({ model })
       : null);
   if (state && openAIResponsesAccumulator && targetFormat === FORMATS.OPENAI_RESPONSES) {
     state.responsesAccumulator = openAIResponsesAccumulator;
   }
+  const reduceOpenAIResponsesOutput = (item) => {
+    if (!openAIResponsesAccumulator) return null;
+    const reduced = reduceResponsesEvent(openAIResponsesAccumulator, item);
+    if (reduced.accepted && isOpenAIResponsesTerminalEvent(reduced.type, reduced.data)) {
+      openAIResponsesTerminalSeen = true;
+    }
+    return reduced;
+  };
 
   const transformStream = new TransformStream({
     transform(chunk, controller) {
@@ -150,7 +159,7 @@ export function createSSEStream(options = {}) {
         }
 
         // Capture Responses API event name to preserve framing in same-format passthrough
-        if (mode === STREAM_MODE.TRANSLATE && targetFormat === FORMATS.OPENAI_RESPONSES && trimmed.startsWith("event:")) {
+        if (openAIResponsesAccumulator && trimmed.startsWith("event:")) {
           currentOpenAIResponsesEvent = trimmed.slice(6).trim();
         }
 
@@ -162,6 +171,12 @@ export function createSSEStream(options = {}) {
           if (trimmed.startsWith("data:") && trimmed.slice(5).trim() !== "[DONE]") {
             try {
               const parsed = JSON.parse(trimmed.slice(5).trim());
+
+              if (openAIResponsesAccumulator) {
+                const eventName = getOpenAIResponsesEventName(currentOpenAIResponsesEvent, parsed);
+                reduceOpenAIResponsesOutput({ event: eventName, data: parsed });
+                currentOpenAIResponsesEvent = null;
+              }
 
               const idFixed = fixInvalidId(parsed);
 
@@ -267,7 +282,7 @@ export function createSSEStream(options = {}) {
         if (upstreamErrorForwarded) continue;
 
         if (parsed.error) {
-          const output = formatTranslatedStreamError(parsed.error, sourceFormat);
+          const output = formatTranslatedStreamError(parsed.error, sourceFormat, openAIResponsesAccumulator);
           reqLogger?.appendConvertedChunk?.(output);
           controller.enqueue(sharedEncoder.encode(output));
           upstreamErrorForwarded = true;
@@ -388,24 +403,30 @@ export function createSSEStream(options = {}) {
         if (translated?.length > 0) {
           for (const item of translated) {
             if (item === null || item === undefined) continue;
+            let outputItem = item;
+            if (sourceFormat === FORMATS.OPENAI_RESPONSES && item.event && item.data) {
+              const reduced = reduceOpenAIResponsesOutput(item);
+              if (!reduced.accepted) continue;
+              outputItem = { event: reduced.type, data: reduced.data };
+            }
             // Filter empty chunks
-            if (!hasValuableContent(item, sourceFormat)) {
+            if (!hasValuableContent(outputItem, sourceFormat)) {
               continue; // Skip this empty chunk
             }
 
             // Inject estimated usage if finish chunk has no valid usage
-            const isFinishChunk = item.type === "message_delta" || item.choices?.[0]?.finish_reason;
-            if (state.finishReason && isFinishChunk && !hasValidUsage(item.usage) && totalContentLength > 0) {
+            const isFinishChunk = outputItem.type === "message_delta" || outputItem.choices?.[0]?.finish_reason;
+            if (state.finishReason && isFinishChunk && !hasValidUsage(outputItem.usage) && totalContentLength > 0) {
               const estimated = estimateUsage(body, totalContentLength, sourceFormat);
-              item.usage = filterUsageForFormat(estimated, sourceFormat); // Filter + already has buffer
+              outputItem.usage = filterUsageForFormat(estimated, sourceFormat); // Filter + already has buffer
               state.usage = mergeUsage(state.usage, estimated);
             } else if (state.finishReason && isFinishChunk && state.usage) {
               // Add buffer and filter usage for client (but keep original in state.usage for logging)
               const buffered = addBufferToUsage(state.usage);
-              item.usage = filterUsageForFormat(buffered, sourceFormat);
+              outputItem.usage = filterUsageForFormat(buffered, sourceFormat);
             }
 
-            const output = formatSSE(item, sourceFormat);
+            const output = formatSSE(outputItem, sourceFormat);
             reqLogger?.appendConvertedChunk?.(output);
             controller.enqueue(sharedEncoder.encode(output));
             sseEmittedCount++;
@@ -498,7 +519,13 @@ export function createSSEStream(options = {}) {
             if (translated?.length > 0) {
               for (const item of translated) {
                 if (item === null || item === undefined) continue;
-                const output = formatSSE(item, sourceFormat);
+                let outputItem = item;
+                if (sourceFormat === FORMATS.OPENAI_RESPONSES && item.event && item.data) {
+                  const reduced = reduceOpenAIResponsesOutput(item);
+                  if (!reduced.accepted) continue;
+                  outputItem = { event: reduced.type, data: reduced.data };
+                }
+                const output = formatSSE(outputItem, sourceFormat);
                 reqLogger?.appendConvertedChunk?.(output);
                 controller.enqueue(sharedEncoder.encode(output));
               }
@@ -595,7 +622,7 @@ export function createSSETransformStreamWithLogger(targetFormat, sourceFormat, p
   });
 }
 
-export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null) {
+export function createPassthroughStreamWithLogger(provider = null, reqLogger = null, model = null, connectionId = null, body = null, onStreamComplete = null, apiKey = null, responsesAccumulator = null) {
   return createSSEStream({
     mode: STREAM_MODE.PASSTHROUGH,
     provider,
@@ -604,6 +631,7 @@ export function createPassthroughStreamWithLogger(provider = null, reqLogger = n
     connectionId,
     body,
     onStreamComplete,
-    apiKey
+    apiKey,
+    responsesAccumulator
   });
 }

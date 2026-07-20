@@ -7,7 +7,10 @@ import {
   reduceResponsesEvent
 } from "../../open-sse/translator/concerns/responsesAccumulator.js";
 import { FORMATS } from "../../open-sse/translator/formats.js";
-import { createSSETransformStreamWithLogger } from "../../open-sse/utils/stream.js";
+import {
+  createPassthroughStreamWithLogger,
+  createSSETransformStreamWithLogger
+} from "../../open-sse/utils/stream.js";
 
 // Minimal stream controller stub
 function makeController() {
@@ -101,6 +104,64 @@ describe("Responses abort terminal synthesis", () => {
     expect(text).toContain('"text":"partial before stall"');
     expect(text.match(/event: response\.failed/g)).toHaveLength(1);
     expect(buildAbortedResponsesTerminalBytes(accumulator)).toBeNull();
+  });
+
+  it("tracks raw Responses passthrough output for abort synthesis", async () => {
+    const accumulator = createResponsesAccumulator({ model: "gpt-passthrough" });
+    const transform = createPassthroughStreamWithLogger(
+      "codex",
+      null,
+      "gpt-passthrough",
+      null,
+      null,
+      null,
+      null,
+      accumulator
+    );
+    const encoder = new TextEncoder();
+    const chunks = [
+      [
+        "event: response.created",
+        `data: ${JSON.stringify({
+          type: "response.created",
+          response: { id: "resp_passthrough", status: "in_progress", output: [] }
+        })}`,
+        "",
+        ""
+      ].join("\n"),
+      [
+        "event: response.output_text.delta",
+        `data: ${JSON.stringify({
+          type: "response.output_text.delta",
+          output_index: 0,
+          item_id: "msg_passthrough",
+          delta: "partial passthrough"
+        })}`,
+        "",
+        ""
+      ].join("\n")
+    ];
+    let chunkIndex = 0;
+    const upstream = new ReadableStream({
+      pull(controller) {
+        if (chunkIndex < chunks.length) {
+          controller.enqueue(encoder.encode(chunks[chunkIndex++]));
+          return;
+        }
+        controller.error(new Error("stream stall timeout"));
+      }
+    }).pipeThrough(transform);
+
+    const out = createDisconnectAwareStream(
+      { readable: upstream, writable: { getWriter: () => ({ abort: () => Promise.resolve() }) } },
+      makeController(),
+      () => buildAbortedResponsesTerminalBytes(accumulator)
+    );
+
+    const text = await readAll(out);
+    expect(text).toContain('"id":"resp_passthrough"');
+    expect(text).toContain('"text":"partial passthrough"');
+    expect(text.match(/event: response\.failed/g)).toHaveLength(1);
   });
 
   it("emits only DONE when abort follows an accepted Responses terminal", () => {

@@ -229,7 +229,7 @@ describe("Kiro nested tool_call validation", () => {
     expect(text).toContain("data: [DONE]");
   });
 
-  it("translates Kiro stream errors into Responses response.failed events", async () => {
+  it("preserves partial Responses output when translating Kiro stream errors", async () => {
     const transform = createSSETransformStreamWithLogger(
       FORMATS.KIRO,
       FORMATS.OPENAI_RESPONSES,
@@ -241,6 +241,9 @@ describe("Kiro nested tool_call validation", () => {
     const writer = transform.writable.getWriter();
     const readPromise = collectText(transform.readable);
     await writer.write(new TextEncoder().encode(
+      "data: {\"id\":\"chatcmpl_partial\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"kr/claude-opus-4.8\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial before failure\"},\"finish_reason\":null}]}\n\n"
+    ));
+    await writer.write(new TextEncoder().encode(
       "data: {\"error\":{\"message\":\"Invalid Kiro tool_call payload: missing nested MCP tool name at input.name\",\"type\":\"invalid_request_error\",\"code\":\"invalid_kiro_tool_call\"}}\n\n"
     ));
     await writer.close();
@@ -250,8 +253,34 @@ describe("Kiro nested tool_call validation", () => {
     expect(text).toContain("event: response.failed");
     expect(text).toContain("invalid_kiro_tool_call");
     expect(text).toContain("missing nested MCP tool name");
-    expect(text).not.toContain("response.output_item.added");
+    expect(text).toContain('"text":"partial before failure"');
+    expect(text).toContain("response.output_item.added");
     expect(text).toContain("data: [DONE]");
+  });
+
+  it.each([
+    [FORMATS.CLAUDE, "event: error", "data: [DONE]"],
+    [FORMATS.ANTIGRAVITY, 'data: {"error":', "data: [DONE]"],
+    [FORMATS.OLLAMA, '{"error":"upstream failed"}', "data:"]
+  ])("uses %s-native framing for translated stream errors", async (sourceFormat, expected, forbidden) => {
+    const transform = createSSETransformStreamWithLogger(
+      FORMATS.KIRO,
+      sourceFormat,
+      "kiro",
+      null,
+      null,
+      "kr/claude-opus-4.8"
+    );
+    const writer = transform.writable.getWriter();
+    const readPromise = collectText(transform.readable);
+    await writer.write(new TextEncoder().encode(
+      "data: {\"error\":{\"message\":\"upstream failed\",\"type\":\"server_error\",\"code\":\"kiro_stream_error\"}}\n\n"
+    ));
+    await writer.close();
+
+    const text = await readPromise;
+    expect(text).toContain(expected);
+    expect(text).not.toContain(forbidden);
   });
 
   it("does not change non-Kiro OpenAI function_call translation", () => {

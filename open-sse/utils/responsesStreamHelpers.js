@@ -47,13 +47,17 @@ export function buildAbortedResponsesTerminalBytes(accumulator = null) {
 
 // Synthesize a response.failed event for streams that close without a terminal event
 export function formatIncompleteOpenAIResponsesStreamFailure(accumulator = null) {
+  return formatOpenAIResponsesStreamFailure(accumulator, {
+    type: "stream_error",
+    code: "stream_disconnected",
+    message: "stream closed before response.completed"
+  });
+}
+
+export function formatOpenAIResponsesStreamFailure(accumulator = null, error = null) {
   const state = accumulator || createResponsesAccumulator();
   const terminal = finalizeResponsesAccumulator(state, {
-    error: {
-      type: "stream_error",
-      code: "stream_disconnected",
-      message: "stream closed before response.completed"
-    }
+    error
   });
   if (!terminal.accepted) return "";
   return formatSSE({
