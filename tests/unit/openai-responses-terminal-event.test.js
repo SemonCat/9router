@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { FORMATS } from "../../open-sse/translator/formats.js";
 import { createSSETransformStreamWithLogger } from "../../open-sse/utils/stream.js";
 
-async function runTransform(input) {
+async function runTransform(input, targetFormat = FORMATS.OPENAI_RESPONSES) {
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     start(controller) {
@@ -14,7 +14,7 @@ async function runTransform(input) {
 
   const output = stream.pipeThrough(
     createSSETransformStreamWithLogger(
-      FORMATS.OPENAI_RESPONSES,
+      targetFormat,
       FORMATS.OPENAI_RESPONSES,
       "codex",
       null,
@@ -38,6 +38,47 @@ async function runTransform(input) {
 }
 
 describe("OpenAI Responses streaming termination", () => {
+  it("fails a partial OpenAI provider stream that reaches clean EOF without a terminal", async () => {
+    const output = await runTransform([
+      `data: ${JSON.stringify({
+        id: "chatcmpl_partial_eof",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt-5.5",
+        choices: [{ index: 0, delta: { content: "partial ordinary output" }, finish_reason: null }]
+      })}`,
+      "",
+    ].join("\n"), FORMATS.OPENAI);
+
+    expect(output).not.toContain("event: response.completed");
+    expect(output.match(/event: response\.failed/g)).toHaveLength(1);
+    expect(output).toContain('"id":"resp_chatcmpl_partial_eof"');
+    expect(output).toContain('"text":"partial ordinary output"');
+    expect(output.match(/data: \[DONE\]/g)).toHaveLength(1);
+  });
+
+  it("preserves one completed terminal for an ordinary provider with a real finish", async () => {
+    const chunk = finishReason => `data: ${JSON.stringify({
+      id: "chatcmpl_complete",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "gpt-5.5",
+      choices: [{ index: 0, delta: {}, finish_reason: finishReason }]
+    })}`;
+    const output = await runTransform([
+      chunk("stop"),
+      "",
+      chunk("stop"),
+      "",
+      "data: [DONE]",
+      "",
+    ].join("\n"), FORMATS.OPENAI);
+
+    expect(output.match(/event: response\.completed/g)).toHaveLength(1);
+    expect(output).not.toContain("event: response.failed");
+    expect(output.match(/data: \[DONE\]/g)).toHaveLength(1);
+  });
+
   it("emits a response.failed event when a Responses stream closes before a terminal event", async () => {
     const output = await runTransform([
       `event: response.created`,

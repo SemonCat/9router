@@ -49,6 +49,23 @@ async function handleWithUserAgent(userAgent) {
   });
 }
 
+async function handleResponsesClient(targetFormat) {
+  return handleStreamingResponse({
+    providerResponse: responsesProviderResponse(),
+    provider: "test-provider",
+    model: "test-model",
+    sourceFormat: FORMATS.OPENAI_RESPONSES,
+    targetFormat,
+    userAgent: "9router-test-client/1.0",
+    body: { model: "test-model", stream: true },
+    stream: true,
+    requestStartTime: Date.now(),
+    connectionId: "test-connection",
+    clientRawRequest: { endpoint: "/v1/responses" },
+    streamController: {}
+  });
+}
+
 describe("Responses streaming handler CLI passthrough", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -89,4 +106,31 @@ describe("Responses streaming handler CLI passthrough", () => {
     expect(translateMock).toHaveBeenCalledOnce();
     expect(passthroughMock).not.toHaveBeenCalled();
   });
+
+  it.each([FORMATS.OPENAI, FORMATS.CLAUDE, FORMATS.GEMINI])(
+    "installs a Responses abort terminal for %s provider output",
+    async targetFormat => {
+      await handleResponsesClient(targetFormat);
+
+      const accumulator = translateMock.mock.calls[0][10];
+      reduceResponsesEvent(accumulator, {
+        type: "response.created",
+        response: { id: `resp_${targetFormat}`, status: "in_progress", output: [] }
+      });
+      reduceResponsesEvent(accumulator, {
+        type: "response.output_text.delta",
+        output_index: 0,
+        item_id: `msg_${targetFormat}`,
+        delta: `partial ${targetFormat}`
+      });
+
+      const onAbortTerminal = pipeMock.mock.calls[0][3];
+      const terminalText = new TextDecoder().decode(onAbortTerminal());
+      expect(terminalText).toContain("event: response.failed");
+      expect(terminalText).toContain(`\"id\":\"resp_${targetFormat}\"`);
+      expect(terminalText).toContain(`\"text\":\"partial ${targetFormat}\"`);
+      expect(terminalText.match(/event: response\.failed/g)).toHaveLength(1);
+      expect(terminalText.match(/data: \[DONE\]/g)).toHaveLength(1);
+    }
+  );
 });

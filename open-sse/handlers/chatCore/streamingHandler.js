@@ -35,7 +35,7 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
   }
 
   if (needsTranslation(targetFormat, sourceFormat)) {
-    return createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey);
+    return createSSETransformStreamWithLogger(targetFormat, sourceFormat, provider, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey, responsesAccumulator);
   }
 
   return createPassthroughStreamWithLogger(provider, reqLogger, model, connectionId, body, onStreamComplete, apiKey, responsesAccumulator);
@@ -80,14 +80,14 @@ export async function handleStreamingResponse({ providerResponse, provider, mode
     };
   }
 
-  // Responses passthrough: synthesize response.failed + [DONE] if the stream aborts/stalls before a terminal event
-  const isResponsesPassthrough = sourceFormat === FORMATS.OPENAI_RESPONSES && targetFormat === FORMATS.OPENAI_RESPONSES;
-  const responsesAccumulator = targetFormat === FORMATS.OPENAI_RESPONSES
+  // Responses clients: synthesize response.failed + [DONE] if the stream aborts/stalls before a terminal event
+  const outputsResponses = sourceFormat === FORMATS.OPENAI_RESPONSES;
+  const responsesAccumulator = outputsResponses
     ? createResponsesAccumulator({ model })
     : null;
   const transformStream = buildTransformStream({ provider, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, model, connectionId, body, onStreamComplete, apiKey, responsesAccumulator });
   let onAbortTerminal = null;
-  if (isResponsesPassthrough) {
+  if (outputsResponses) {
     onAbortTerminal = () => buildAbortedResponsesTerminalBytes(responsesAccumulator);
   } else if (targetFormat === FORMATS.OPENAI_RESPONSES && transformStream.buildAbortedTerminalBytes) {
     onAbortTerminal = () => transformStream.buildAbortedTerminalBytes();

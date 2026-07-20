@@ -320,23 +320,26 @@ export function createSSEStream(options = {}) {
         // For Ollama: done=true is the final chunk with finish_reason/usage, must translate
         // For other formats: done=true is the [DONE] sentinel, skip
         if (parsed && parsed.done && targetFormat !== FORMATS.OLLAMA) {
+          const outputsOpenAIResponses = sourceFormat === FORMATS.OPENAI_RESPONSES;
           // Synthesize response.failed if the Responses stream never sent a terminal event
-          if (keepsOpenAIResponsesFormat && !openAIResponsesTerminalSeen) {
+          if (outputsOpenAIResponses && !openAIResponsesTerminalSeen) {
             const failedOutput = formatIncompleteOpenAIResponsesStreamFailure(openAIResponsesAccumulator);
-            reqLogger?.appendConvertedChunk?.(failedOutput);
-            controller.enqueue(sharedEncoder.encode(failedOutput));
+            if (failedOutput) {
+              reqLogger?.appendConvertedChunk?.(failedOutput);
+              controller.enqueue(sharedEncoder.encode(failedOutput));
+            }
             openAIResponsesTerminalSeen = true;
             sseEmittedCount++;
           }
 
-          if (keepsOpenAIResponsesFormat && !streamDoneSent) {
+          if (outputsOpenAIResponses && !streamDoneSent) {
             const doneOutput = "data: [DONE]\n\n";
             reqLogger?.appendConvertedChunk?.(doneOutput);
             controller.enqueue(sharedEncoder.encode(doneOutput));
             openAIResponsesAccumulator.doneSent = true;
           }
           streamDoneSent = true;
-          if (keepsOpenAIResponsesFormat) openAIResponsesDoneSent = true;
+          if (outputsOpenAIResponses) openAIResponsesDoneSent = true;
           continue;
         }
 
@@ -549,22 +552,36 @@ export function createSSEStream(options = {}) {
         if (flushed?.length > 0) {
           for (const item of flushed) {
             if (item === null || item === undefined) continue;
-            const output = formatSSE(item, sourceFormat);
+            let outputItem = item;
+            if (sourceFormat === FORMATS.OPENAI_RESPONSES && item.event && item.data) {
+              // A provider EOF is not a successful terminal. Keep any closing item
+              // snapshots produced by the translator, but replace its synthetic
+              // response.completed with response.failed below.
+              if (!openAIResponsesTerminalSeen && isOpenAIResponsesTerminalEvent(item.event, item.data)) {
+                continue;
+              }
+              const reduced = reduceOpenAIResponsesOutput(item);
+              if (!reduced.accepted) continue;
+              outputItem = { event: reduced.type, data: reduced.data };
+            }
+            const output = formatSSE(outputItem, sourceFormat);
             reqLogger?.appendConvertedChunk?.(output);
             controller.enqueue(sharedEncoder.encode(output));
           }
         }
 
-        // Synthesize response.failed if a Responses passthrough stream never reached a terminal event
-        const keepsOpenAIResponsesFormat = targetFormat === FORMATS.OPENAI_RESPONSES && sourceFormat === FORMATS.OPENAI_RESPONSES;
-        if (keepsOpenAIResponsesFormat && !openAIResponsesTerminalSeen) {
+        // Synthesize response.failed if a Responses client never received a real upstream terminal event
+        const outputsOpenAIResponses = sourceFormat === FORMATS.OPENAI_RESPONSES;
+        if (outputsOpenAIResponses && !openAIResponsesTerminalSeen) {
           const failedOutput = formatIncompleteOpenAIResponsesStreamFailure(openAIResponsesAccumulator);
-          reqLogger?.appendConvertedChunk?.(failedOutput);
-          controller.enqueue(sharedEncoder.encode(failedOutput));
+          if (failedOutput) {
+            reqLogger?.appendConvertedChunk?.(failedOutput);
+            controller.enqueue(sharedEncoder.encode(failedOutput));
+          }
           openAIResponsesTerminalSeen = true;
         }
 
-        if (keepsOpenAIResponsesFormat && !openAIResponsesDoneSent && !streamDoneSent) {
+        if (outputsOpenAIResponses && !openAIResponsesDoneSent && !streamDoneSent) {
           const doneOutput = "data: [DONE]\n\n";
           reqLogger?.appendConvertedChunk?.(doneOutput);
           controller.enqueue(sharedEncoder.encode(doneOutput));
