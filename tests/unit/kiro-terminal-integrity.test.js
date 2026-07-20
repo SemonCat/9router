@@ -204,37 +204,14 @@ describe("Kiro terminal integrity recovery", () => {
     expect(body).not.toContain("kiro_missing_terminal");
   });
 
-  it.each(["...", "…"])("repairs exact ellipsis final %s without leaking it", async (ellipsis) => {
-    fetchMock
-      .mockResolvedValueOnce(response([frame("assistantResponseEvent", { content: ellipsis })]))
-      .mockResolvedValueOnce(response([frame("assistantResponseEvent", { content: "Recovered answer." })]));
-
-    const body = await (await execute()).response.text();
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(body).toContain("Recovered answer.");
-    expect(body).not.toContain(`"content":"${ellipsis}"`);
-  });
-
   it.each([
+    "...",
+    "…",
     "接下來我只再確認部署結果。",
     "我會重新抓取最新日誌並確認結果。",
     "目前證據顯示只在 **03:48:30–03:49:00 TPE** 出現少量 NonKA 504；主池 106/106、副池 50/50，且兩池都沒有重啟。最後補查 504 access log，確認 host／路徑與是否為集中流量。",
     "Next I'll verify the deployment logs.",
-    "Let me check the remaining failures."
-  ])("repairs conservative future-action final: %s", async (progress) => {
-    fetchMock
-      .mockResolvedValueOnce(response([frame("assistantResponseEvent", { content: progress })]))
-      .mockResolvedValueOnce(response([frame("assistantResponseEvent", { content: "Verification completed." })]));
-
-    const body = await (await execute()).response.text();
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(body).toContain("Verification completed.");
-    expect(body).not.toContain(progress);
-  });
-
-  it.each([
+    "Let me check the remaining failures.",
     "Working...",
     "I'll check the logs. They show no errors and deployment succeeded.",
     "Let me check: status is 200 and the checksum matches abc123.",
@@ -250,7 +227,7 @@ describe("Kiro terminal integrity recovery", () => {
     "目前證據顯示只有少量 504。最後補查 504 access log，確認 host／路徑與是否為集中流量（答案是否定的）。",
     "目前證據顯示只有少量 504。最後補充兩點已確認的結果。",
     "The verification is complete and all tests passed."
-  ])("does not retry legitimate final: %s", async (finalText) => {
+  ])("does not apply semantic policy to a valid terminal final: %s", async (finalText) => {
     fetchMock.mockResolvedValueOnce(response([
       frame("assistantResponseEvent", { content: finalText })
     ]));
@@ -259,18 +236,6 @@ describe("Kiro terminal integrity recovery", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(body).toContain(finalText);
-  });
-
-  it("bounds incomplete-final repair to one retry", async () => {
-    fetchMock
-      .mockResolvedValueOnce(response([frame("assistantResponseEvent", { content: "..." })]))
-      .mockResolvedValueOnce(response([frame("assistantResponseEvent", { content: "…" })]));
-
-    const body = await (await execute()).response.text();
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(body).toContain("kiro_ellipsis_retry_failed");
-    expect(body).not.toContain('"content":"..."');
   });
 
   it("repairs malformed wrapper tools without leaking the invalid call", async () => {
