@@ -364,47 +364,12 @@ describe("Kiro one-shot tool_call repair", () => {
     expect(retryBody.systemPrompt).toContain("Previous validation error");
   });
 
-  it("retries an ellipsis-only final response once without leaking it downstream", async () => {
+  it.each(["...", "…"])("passes an ellipsis final through without semantic retry: %s", async (finalText) => {
     const executor = new KiroExecutor();
-    fetchMock
-      .mockResolvedValueOnce(eventStreamResponse([
-        encodeEventFrame("assistantResponseEvent", { content: "." }),
-        encodeEventFrame("assistantResponseEvent", { content: ".." }),
-        encodeEventFrame("messageStopEvent", {})
-      ]))
-      .mockResolvedValueOnce(eventStreamResponse([
-        encodeEventFrame("assistantResponseEvent", { content: "The investigation is complete." }),
-        encodeEventFrame("messageStopEvent", {})
-      ]));
-
-    const result = await executor.execute({
-      model: "kr/gpt-5.6-sol",
-      body: { systemPrompt: "base", conversationState: {} },
-      stream: true,
-      credentials
-    });
-    const text = await collectText(result.response.body);
-    const chunks = collectDataChunks(text);
-    const content = chunks.map((chunk) => chunk.choices?.[0]?.delta?.content || "").join("");
-    const retryBody = JSON.parse(fetchMock.mock.calls[1][1].body);
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(content).toBe("The investigation is complete.");
-    expect(text).not.toContain('"content":"..."');
-    expect(retryBody.systemPrompt).toContain("ended with only an ellipsis");
-  });
-
-  it("treats a unicode ellipsis-only final response as retryable", async () => {
-    const executor = new KiroExecutor();
-    fetchMock
-      .mockResolvedValueOnce(eventStreamResponse([
-        encodeEventFrame("assistantResponseEvent", { content: "…" }),
-        encodeEventFrame("messageStopEvent", {})
-      ]))
-      .mockResolvedValueOnce(eventStreamResponse([
-        encodeEventFrame("assistantResponseEvent", { content: "Recovered." }),
-        encodeEventFrame("messageStopEvent", {})
-      ]));
+    fetchMock.mockResolvedValueOnce(eventStreamResponse([
+      encodeEventFrame("assistantResponseEvent", { content: finalText }),
+      encodeEventFrame("messageStopEvent", {})
+    ]));
 
     const result = await executor.execute({
       model: "kr/gpt-5.6-sol",
@@ -414,85 +379,9 @@ describe("Kiro one-shot tool_call repair", () => {
     });
     const text = await collectText(result.response.body);
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(text).toContain("Recovered.");
-    expect(text).not.toContain('"content":"…"');
-  });
-
-  it("retries when both reasoning and final content contain only ellipses", async () => {
-    const executor = new KiroExecutor();
-    fetchMock
-      .mockResolvedValueOnce(eventStreamResponse([
-        encodeEventFrame("reasoningContentEvent", { content: "..." }),
-        encodeEventFrame("assistantResponseEvent", { content: "…" }),
-        encodeEventFrame("messageStopEvent", {})
-      ]))
-      .mockResolvedValueOnce(eventStreamResponse([
-        encodeEventFrame("assistantResponseEvent", { content: "Recovered after tool use." }),
-        encodeEventFrame("messageStopEvent", {})
-      ]));
-
-    const result = await executor.execute({
-      model: "kr/gpt-5.6-sol",
-      body: { conversationState: {} },
-      stream: true,
-      credentials
-    });
-    const text = await collectText(result.response.body);
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(text).toContain("Recovered after tool use.");
-    expect(text).not.toContain("reasoning_content");
-  });
-
-  it("retries an exact visible ellipsis even after substantive reasoning", async () => {
-    const executor = new KiroExecutor();
-    fetchMock
-      .mockResolvedValueOnce(eventStreamResponse([
-        encodeEventFrame("reasoningContentEvent", { content: "I found the likely root cause." }),
-        encodeEventFrame("assistantResponseEvent", { content: "..." })
-      ]))
-      .mockResolvedValueOnce(eventStreamResponse([
-        encodeEventFrame("assistantResponseEvent", { content: "The root cause is the invalid terminal frame." })
-      ]));
-
-    const result = await executor.execute({
-      model: "kr/gpt-5.6-sol",
-      body: { conversationState: {} },
-      stream: true,
-      credentials
-    });
-    const text = await collectText(result.response.body);
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(text).toContain("The root cause is the invalid terminal frame.");
-    expect(text).not.toContain('"content":"..."');
-    expect(text).not.toContain("I found the likely root cause.");
-  });
-
-  it("returns a retryable upstream error when the ellipsis retry is also invalid", async () => {
-    const executor = new KiroExecutor();
-    fetchMock
-      .mockResolvedValueOnce(eventStreamResponse([
-        encodeEventFrame("assistantResponseEvent", { content: "..." }),
-        encodeEventFrame("messageStopEvent", {})
-      ]))
-      .mockResolvedValueOnce(eventStreamResponse([
-        encodeEventFrame("assistantResponseEvent", { content: "..." }),
-        encodeEventFrame("messageStopEvent", {})
-      ]));
-
-    const result = await executor.execute({
-      model: "kr/gpt-5.6-sol",
-      body: { conversationState: {} },
-      stream: true,
-      credentials
-    });
-    const error = await result.response.json();
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(result.response.status).toBe(502);
-    expect(error.error.code).toBe("kiro_ellipsis_retry_failed");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(text).toContain(finalText);
+    expect(text).toContain('"finish_reason":"stop"');
   });
 
   it("does not retry legitimate text that merely ends with an ellipsis", async () => {
@@ -1008,72 +897,11 @@ describe("Kiro one-shot tool_call repair", () => {
       "Next I'll verify the deployment logs.",
       "I'll verify the deployment logs now.",
       "Let me check the remaining failures."
-    ])("retries a Kiro-only short future-action final: %s", async (shortFinal) => {
+    ])("passes a Kiro-only future-action final through unchanged: %s", async (shortFinal) => {
       const executor = new KiroExecutor();
-      fetchMock
-        .mockResolvedValueOnce(eventStreamResponse([
-          encodeEventFrame("assistantResponseEvent", { content: shortFinal })
-        ]))
-        .mockResolvedValueOnce(eventStreamResponse([
-          encodeEventFrame("assistantResponseEvent", { content: "Verification completed successfully." })
-        ]));
-
-      const result = await executor.execute({
-        model: "kr/gpt-5.6-sol",
-        body: { conversationState: {} },
-        stream: true,
-        credentials
-      });
-      const text = await collectText(result.response.body);
-
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-      expect(text).toContain("Verification completed successfully.");
-      expect(text).not.toContain(shortFinal);
-    });
-
-    it("holds the observed Chinese progress-only final until terminal classification", async () => {
-      const shortFinal = "我會重新抓取 parent thread、指定 Sentry event 與 issue 最新分布，並以目前程式碼/git lineage 交叉驗證；以下調查會以這次查詢結果為準。";
-      const executor = new KiroExecutor();
-      const firstAttempt = controlledEventStreamResponse([
+      fetchMock.mockResolvedValueOnce(eventStreamResponse([
         encodeEventFrame("assistantResponseEvent", { content: shortFinal })
-      ]);
-      fetchMock
-        .mockResolvedValueOnce(firstAttempt.response)
-        .mockResolvedValueOnce(eventStreamResponse([
-          encodeEventFrame("assistantResponseEvent", { content: "Verification completed successfully." })
-        ]));
-
-      const resultPromise = executor.execute({
-        model: "kr/gpt-5.6-sol",
-        body: { conversationState: {} },
-        stream: true,
-        credentials
-      });
-      const earlyResult = await Promise.race([
-        resultPromise.then(() => "settled"),
-        new Promise((resolve) => setTimeout(() => resolve("pending"), 25))
-      ]);
-
-      expect(earlyResult).toBe("pending");
-      firstAttempt.close();
-      const result = await resultPromise;
-      const text = await collectText(result.response.body);
-
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-      expect(text).toContain("Verification completed successfully.");
-      expect(text).not.toContain(shortFinal);
-    });
-
-    it("bounds short future-action repair to one retry", async () => {
-      const shortFinal = "Next I'll verify the deployment logs.";
-      const executor = new KiroExecutor();
-      fetchMock
-        .mockResolvedValueOnce(eventStreamResponse([
-          encodeEventFrame("assistantResponseEvent", { content: shortFinal })
-        ]))
-        .mockResolvedValueOnce(eventStreamResponse([
-          encodeEventFrame("assistantResponseEvent", { content: shortFinal })
-        ]));
+      ]));
 
       const result = await executor.execute({
         model: "kr/gpt-5.6-sol",
@@ -1081,11 +909,11 @@ describe("Kiro one-shot tool_call repair", () => {
         stream: true,
         credentials
       });
-      const error = await result.response.json();
+      const text = await collectText(result.response.body);
 
-      expect(fetchMock).toHaveBeenCalledTimes(2);
-      expect(result.response.status).toBe(502);
-      expect(error.error.code).toBe("kiro_short_final_retry_failed");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(text).toContain(shortFinal);
+      expect(text).toContain('"finish_reason":"stop"');
     });
 
     it.each([

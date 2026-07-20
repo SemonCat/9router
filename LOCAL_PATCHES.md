@@ -33,24 +33,25 @@ Apply or resolve the groups in this order:
 
 1. #2618 credit metering, then #2639 session affinity.
 2. #2707 reasoning effort, then #2688 nested tool validation/one-shot repair.
-3. Ellipsis-only retry and bounded future-action recovery (`a5caa7c`).
-4. #2713 Responses accumulation and terminal reconstruction (`96e317b`,
+3. #2713 Responses accumulation and terminal reconstruction (`96e317b`,
    `7888c28`).
-5. Kiro terminal/EventStream integrity (`e3d53a5`, `5e91b6d`, `afd773d`):
+4. Kiro terminal/EventStream integrity (`e3d53a5`, `5e91b6d`, `afd773d`):
    terminal provenance, CRC/frame validation, bounded retry, and error frames.
-6. Guard-v2 observed short-final recovery (`22962ff`). This was reconstructed
-   from read-only live source plus the matching backup diff; it is not guessed.
-7. #2664 aggregation/cooldown integration (`99c816d`, `e2f794c`, `d424788`,
+5. #2664 aggregation/cooldown integration (`99c816d`, `e2f794c`, `d424788`,
    `495e569`).
-8. Latest #2707 unsupported-effort fallback hardening (`19d3620`).
-9. Consolidation review hardening: after the private repair gate releases a
+6. Latest #2707 unsupported-effort fallback hardening (`19d3620`).
+7. Consolidation review hardening: after the private repair gate releases a
    valid text prefix, any later malformed tool call is surfaced as a terminal
    SSE error instead of silently truncating the client stream. Buffered
    malformed output still follows the existing one-shot repair path.
+8. Transport-only cleanup on the deploy branch removes ellipsis/future-action
+   phrase classification inherited from `a5caa7c`/`22962ff`. Valid response
+   prose passes through unchanged; Hermes owns semantic completion recovery.
 
-The ellipsis/terminal/guard changes all touch the Kiro streaming state machine;
-resolve them semantically in the order above rather than accepting one side of
-a conflict wholesale. The #2639 and #2664 changes both touch account selection;
+The tool-repair and terminal changes touch the Kiro streaming state machine;
+resolve them as protocol behavior rather than accepting one side of a conflict
+wholesale. Do not restore response-text classification from the historical
+ellipsis/guard commits. The #2639 and #2664 changes both touch account selection;
 sticky bindings must survive transient locks while permanent/aggregate lock
 metadata remains paired with its owning account.
 
@@ -63,8 +64,9 @@ metadata remains paired with its owning account.
    upstream, prove equivalent behavior and tests before dropping its local
    commits.
 4. For an updated PR head, compare the old and new heads first (for example
-   with `git range-diff`), then port only the new semantic delta. Do not
-   overwrite the later terminal, guard-v2, or aggregation hardening.
+   with `git range-diff`), then port only the new protocol delta. Do not
+   reintroduce router-level semantic completion policy or overwrite later
+   terminal/aggregation hardening.
 5. Repeat source-parity review and all validation below. Record any intentional
    production deviation here before deployment is considered.
 
@@ -92,6 +94,13 @@ repair gate hands an already-started stream to the client. This fixes a P1
 terminal-integrity hole found during closeout review without changing the
 buffered one-shot repair behavior. `LOCAL_PATCHES.md` and restored/expanded
 regression tests are otherwise repository-only additions.
+
+The deploy branch adds a second intentional deviation from the historical live
+image: Kiro ellipsis and future-action text are no longer retried or classified
+inside 9Router. Only EventStream framing, terminal provenance, upstream error
+frames, empty/incomplete output, and malformed tool-call protocol remain router
+concerns. Hermes installs `incomplete-final-recovery` to handle semantic
+COMPLETE/BLOCKED/CONTINUE decisions with the original request and tool history.
 
 ## Validation
 

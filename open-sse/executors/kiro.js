@@ -15,7 +15,6 @@ const KIRO_TOOL_CALL_REPAIR_TIMEOUT_MS_ENV = "KIRO_TOOL_CALL_REPAIR_TIMEOUT_MS";
 const KIRO_TOOL_CALL_REPAIR_TTFT_TIMEOUT_MS_ENV = "KIRO_TOOL_CALL_REPAIR_TTFT_TIMEOUT_MS";
 const KIRO_TOOL_CALL_REPAIR_STALL_TIMEOUT_MS_ENV = "KIRO_TOOL_CALL_REPAIR_STALL_TIMEOUT_MS";
 const KIRO_TOOL_CALL_REPAIR_BUFFER_MAX_BYTES = 8 * 1024 * 1024;
-const KIRO_SHORT_FINAL_MAX_CHARS = 800;
 const KIRO_TERMINAL_PROVENANCE = Object.freeze({
   MESSAGE_STOP: "message_stop_event",
   CLEAN_EOF: "clean_eventstream_eof",
@@ -40,35 +39,6 @@ const KIRO_TOOL_CALL_REPAIR_INSTRUCTION = [
   "If you use the wrapper tool named tool_call, its input must be a JSON object with a non-empty string name and an arguments field.",
   "Do not emit a tool_call wrapper without input.name and input.arguments."
 ].join(" ");
-const KIRO_ELLIPSIS_REPAIR_INSTRUCTION = [
-  "Retry the previous response because it ended with only an ellipsis instead of a complete answer.",
-  "Use the existing conversation and tool results to provide the full final answer.",
-  "Do not answer with only ... or …."
-].join(" ");
-const KIRO_SHORT_FINAL_REPAIR_INSTRUCTION = [
-  "Retry the previous response because its short final only announced a future action instead of reporting the result.",
-  "Complete the announced check now and return the result or a concrete blocker.",
-  "Do not repeat a progress update as the final answer."
-].join(" ");
-const KIRO_SHORT_FINAL_PREFIXES = Object.freeze([
-  "現在",
-  "接著",
-  "接下來",
-  "下一步",
-  "我只再",
-  "我會重新抓取",
-  "next",
-  "now",
-  "then",
-  "i'll",
-  "i will",
-  "i am going to",
-  "i need to",
-  "let me"
-]);
-const KIRO_SHORT_FUTURE_ACTION_PATTERN = /^(?:(?:(?:現在|接著|接下來|下一步)[，,:：\s]*(?:我(?:只)?(?:會|要|將|再)?\s*)?|我只再)(?:補|查|確認|驗證|追(?:查|蹤)?|繼續|檢查|測試)|我會重新抓取(?=[\s\S]*調查會以[\s\S]+為準[。.!]?$)|(?:(?:next|now|then)\b[\s,:-]*)?(?:i(?:'ll| will| am going to| need to)|let me)\s+(?:verify|check|confirm|validate|investigate|trace|continue|follow up|test)\b)/iu;
-const KIRO_SHORT_FINAL_USER_WAIT_PATTERN = /(?:請(?:你|先)|你(?:先|需要|可以|提供|確認|批准|允許)|等待(?:你|使用者)|等你|核准|同意|授權|\b(?:after|when|once)\s+you\b|\byour\s+(?:approval|confirmation|permission|input)\b|\bwait(?:ing)?\s+for\s+you\b|\bplease\s+(?:approve|confirm|provide|send)\b)/iu;
-const KIRO_SHORT_FINAL_COMPLETE_PATTERN = /(?:已(?:經)?完成|完成(?:了|驗證|確認)|修復完成|確認無誤|驗證(?:完成|通過)|測試(?:均)?通過|結論|總結|\b(?:done|completed|fixed|verified|confirmed|passed|in conclusion|summary)\b|\b(?:is|are) complete\b)/iu;
 const CRC32_TABLE = Uint32Array.from({ length: 256 }, (_, index) => {
   let value = index;
   for (let bit = 0; bit < 8; bit++) {
@@ -105,22 +75,6 @@ function buildKiroToolCallRepairBody(body, invalidMessage) {
   repaired.systemPrompt = repaired.systemPrompt
     ? `${repaired.systemPrompt}\n\n${instruction}`
     : instruction;
-  return repaired;
-}
-
-function buildKiroEllipsisRepairBody(body) {
-  const repaired = JSON.parse(JSON.stringify(body || {}));
-  repaired.systemPrompt = repaired.systemPrompt
-    ? `${repaired.systemPrompt}\n\n${KIRO_ELLIPSIS_REPAIR_INSTRUCTION}`
-    : KIRO_ELLIPSIS_REPAIR_INSTRUCTION;
-  return repaired;
-}
-
-function buildKiroShortFinalRepairBody(body) {
-  const repaired = JSON.parse(JSON.stringify(body || {}));
-  repaired.systemPrompt = repaired.systemPrompt
-    ? `${repaired.systemPrompt}\n\n${KIRO_SHORT_FINAL_REPAIR_INSTRUCTION}`
-    : KIRO_SHORT_FINAL_REPAIR_INSTRUCTION;
   return repaired;
 }
 
@@ -200,49 +154,7 @@ function concatChunks(chunks, totalBytes) {
   return out;
 }
 
-function isEllipsisOnly(value) {
-  const normalized = String(value || "").trim();
-  return normalized === "..." || normalized === "…";
-}
-
-function isPossibleEllipsisPrefix(value) {
-  const normalized = String(value || "").trim();
-  return normalized === "" || normalized === "." || normalized === ".." || isEllipsisOnly(normalized);
-}
-
-function normalizeKiroShortFinal(value) {
-  return String(value || "").trim().replaceAll("’", "'");
-}
-
-function isPossibleShortFutureActionPrefix(value) {
-  const normalized = normalizeKiroShortFinal(value).toLowerCase();
-  if (!normalized || normalized.length > KIRO_SHORT_FINAL_MAX_CHARS) return false;
-  return KIRO_SHORT_FINAL_PREFIXES.some((prefix) =>
-    prefix.startsWith(normalized) || normalized.startsWith(prefix)
-  );
-}
-
-function isShortFutureActionFinal(value) {
-  const normalized = normalizeKiroShortFinal(value);
-  return normalized.length > 0 &&
-    normalized.length <= KIRO_SHORT_FINAL_MAX_CHARS &&
-    KIRO_SHORT_FUTURE_ACTION_PATTERN.test(normalized) &&
-    !KIRO_SHORT_FINAL_USER_WAIT_PATTERN.test(normalized) &&
-    !KIRO_SHORT_FINAL_COMPLETE_PATTERN.test(normalized);
-}
-
-function classifyKiroGatedOutput(state) {
-  if (state.hasToolCalls) return null;
-  const visible = state.content.trim();
-  if (visible) {
-    if (isEllipsisOnly(visible)) return "ellipsis";
-    if (isShortFutureActionFinal(visible)) return "short_final";
-    return null;
-  }
-  return isEllipsisOnly(state.reasoningContent) ? "ellipsis" : null;
-}
-
-function inspectRepairSSEChunk(chunk, state) {
+function inspectRepairSSEChunk(chunk) {
   const text = sharedDecoder.decode(chunk);
   let safeToStream = false;
 
@@ -264,53 +176,20 @@ function inspectRepairSSEChunk(chunk, state) {
     for (const choice of event?.choices || []) {
       const delta = choice?.delta || {};
       if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
-        state.hasToolCalls = true;
         safeToStream = true;
       }
 
       if (typeof delta.content === "string") {
-        state.content += delta.content;
-        if (!isPossibleEllipsisPrefix(state.content) &&
-            !isPossibleShortFutureActionPrefix(state.content)) {
-          safeToStream = true;
-        }
+        safeToStream = true;
       }
 
       if (typeof delta.reasoning_content === "string") {
-        state.reasoningContent += delta.reasoning_content;
+        safeToStream = true;
       }
     }
   }
 
   return { safeToStream };
-}
-
-function formatKiroEllipsisRetryFailure() {
-  return new Response(JSON.stringify({
-    error: {
-      message: "Kiro returned an ellipsis-only final response after one retry",
-      type: "upstream_error",
-      code: "kiro_ellipsis_retry_failed"
-    }
-  }), {
-    status: 502,
-    statusText: "Bad Gateway",
-    headers: { "Content-Type": "application/json" }
-  });
-}
-
-function formatKiroShortFinalRetryFailure() {
-  return new Response(JSON.stringify({
-    error: {
-      message: "Kiro returned a short future-action final after one retry",
-      type: "upstream_error",
-      code: "kiro_short_final_retry_failed"
-    }
-  }), {
-    status: 502,
-    statusText: "Bad Gateway",
-    headers: { "Content-Type": "application/json" }
-  });
 }
 
 function createKiroEventCounts() {
@@ -748,9 +627,9 @@ export class KiroExecutor extends BaseExecutor {
     const toolCallRepairEnabled = args.credentials?.providerSpecificData?.kiroToolCallRepair !== false &&
       process.env.KIRO_TOOL_CALL_REPAIR !== "false";
 
-    // Hold only an ellipsis/future-action-shaped prefix or malformed output.
-    // Ordinary semantic output and tool calls stream immediately; clean EOF
-    // finalizes the turn, while empty/incomplete streams stay private for repair.
+    // Validate only transport/protocol state here. Semantic task completion
+    // belongs to the agent layer, which has the original goal and tool history.
+    // Valid text (including ellipses and future-action prose) streams unchanged.
     try {
       const firstAttempt = await this.openToolCallRepairGate(firstResult.response, args, {
         signal: combined.signal,
@@ -810,21 +689,10 @@ export class KiroExecutor extends BaseExecutor {
         return firstResult;
       }
 
-      const repairingEllipsis = firstAttempt.kind === "ellipsis";
-      const repairingShortFinal = firstAttempt.kind === "short_final";
       const repairingMissingTerminal = firstAttempt.kind === "missing_terminal";
-      if (repairingEllipsis) {
-        console.warn(`[Kiro] Ellipsis-only final response detected for ${args.model}; retrying once`);
-      } else if (repairingShortFinal) {
-        console.warn(`[Kiro] Short future-action final detected for ${args.model}; retrying once`);
-      }
       const repairBody = repairingMissingTerminal
         ? JSON.parse(JSON.stringify(args.body || {}))
-        : repairingEllipsis
-          ? buildKiroEllipsisRepairBody(args.body)
-          : repairingShortFinal
-            ? buildKiroShortFinalRepairBody(args.body)
-            : buildKiroToolCallRepairBody(args.body, firstAttempt.invalidToolCall);
+        : buildKiroToolCallRepairBody(args.body, firstAttempt.invalidToolCall);
       const retryResult = await executeRaw({
         ...args,
         body: repairBody,
@@ -867,18 +735,6 @@ export class KiroExecutor extends BaseExecutor {
           statusText: retryResult.response.statusText,
           headers: { ...SSE_HEADERS }
         });
-        return retryResult;
-      }
-
-      if (retryAttempt.kind === "ellipsis") {
-        console.warn(`[Kiro] Ellipsis-only final response persisted after retry for ${args.model}`);
-        retryResult.response = formatKiroEllipsisRetryFailure();
-        return retryResult;
-      }
-
-      if (retryAttempt.kind === "short_final") {
-        console.warn(`[Kiro] Short future-action final persisted after retry for ${args.model}`);
-        retryResult.response = formatKiroShortFinalRetryFailure();
         return retryResult;
       }
 
@@ -936,12 +792,6 @@ export class KiroExecutor extends BaseExecutor {
     const bufferedChunks = [];
     let totalBytes = 0;
     let sawAnyChunk = false;
-    const outputState = {
-      content: "",
-      reasoningContent: "",
-      hasToolCalls: false
-    };
-
     try {
       while (true) {
         const timeoutMs = sawAnyChunk ? options.stallTimeoutMs : options.ttftTimeoutMs;
@@ -965,8 +815,6 @@ export class KiroExecutor extends BaseExecutor {
           if (isKiroTerminalFailure(loggedDiagnostics.terminal_provenance)) {
             return { kind: "missing_terminal", terminalDiagnostics: loggedDiagnostics };
           }
-          const gatedOutputKind = classifyKiroGatedOutput(outputState);
-          if (gatedOutputKind) return { kind: gatedOutputKind };
           return { kind: "complete", bytes: concatChunks(bufferedChunks, totalBytes) };
         }
 
@@ -983,7 +831,7 @@ export class KiroExecutor extends BaseExecutor {
         }
 
         bufferedChunks.push(value);
-        const inspection = inspectRepairSSEChunk(value, outputState);
+        const inspection = inspectRepairSSEChunk(value);
 
         if (terminalDiagnostics) {
           const loggedDiagnostics = logKiroTerminalDiagnostics(
@@ -994,12 +842,6 @@ export class KiroExecutor extends BaseExecutor {
           if (isKiroTerminalFailure(loggedDiagnostics.terminal_provenance)) {
             await reader.cancel("kiro_missing_terminal").catch(() => {});
             return { kind: "missing_terminal", terminalDiagnostics: loggedDiagnostics };
-          }
-
-          const gatedOutputKind = classifyKiroGatedOutput(outputState);
-          if (gatedOutputKind) {
-            await reader.cancel(`kiro_${gatedOutputKind}_retry`).catch(() => {});
-            return { kind: gatedOutputKind };
           }
 
           // The repair gate no longer owns validation failures after bytes are
@@ -1013,8 +855,9 @@ export class KiroExecutor extends BaseExecutor {
           };
         }
 
-        // Match Kiro CLI streaming behavior: once output cannot be an
-        // ellipsis-only false final, release it without waiting for EOF.
+        // Match Kiro CLI streaming behavior: release validated semantic output
+        // without inspecting its wording. Later corrupt/error frames still
+        // surface as terminal SSE errors instead of being reclassified as text.
         if (inspection.safeToStream) {
           transformOptions.suppressInvalidToolCallError = false;
           return {
