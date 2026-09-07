@@ -44,10 +44,22 @@ function profile(body, policy) {
   return blocks.length ? { blocks, tokens } : null;
 }
 
+function creditDensity(observation) {
+  let total = observation.totalTokens;
+  if (!Number.isSafeInteger(total) || total <= 0) {
+    if (!Number.isSafeInteger(observation.inputTokens) || observation.inputTokens < 0) return null;
+    total = observation.inputTokens + observation.outputTokens;
+  }
+  if (!Number.isSafeInteger(total) || total <= 0) return null;
+  const density = observation.credits / total;
+  return Number.isFinite(density) && density > 0 ? density : null;
+}
+
 /** Bounded, process-local conservative calibration from comparable native credits. */
 export class KiroCreditCache {
-  constructor({ now = Date.now } = {}) {
+  constructor({ now = Date.now, staticReadRatio = LIMIT.maxSavings } = {}) {
     this.now = now;
+    this.staticReadRatio = Number.isFinite(staticReadRatio) ? Math.max(0, Math.min(1, staticReadRatio)) : 0;
     this.scopes = new Map();
   }
 
@@ -83,8 +95,9 @@ export class KiroCreditCache {
     const exclusive = scope.active === 0;
     const epoch = ++scope.epoch;
     scope.active++;
+    // An available dynamic zero is authoritative; fallback is only for startup.
     const ratio = scope.pairs.length >= LIMIT.minPairs
-      ? Math.min(LIMIT.maxSavings, ...scope.pairs.map(pair => pair.ratio)) : 0;
+      ? Math.min(LIMIT.maxSavings, ...scope.pairs.map(pair => pair.ratio)) : this.staticReadRatio;
     const fraction = ratio * matched / p.tokens;
     let done = false;
     return {
@@ -107,14 +120,15 @@ export class KiroCreditCache {
             observation.outputTokens < 0 || expires <= now || this.scopes.get(key) !== scope) return;
         // Overlapping native generations can combine unrelated billing/cache effects.
         // They may renew exact prefixes, but cannot contribute calibration pairs.
-        if (exclusive && epoch === scope.epoch) {
-          const sampleKey = fingerprint => hash([shape, observation.outputTokens, fingerprint]);
+        const density = creditDensity(observation);
+        if (exclusive && epoch === scope.epoch && density !== null) {
+          const sampleKey = fingerprint => hash([shape, fingerprint]);
           if (!matched) {
             const k = sampleKey(p.blocks.at(-1).fingerprint);
             const old = scope.samples.get(k);
-            if (!old || old.expires <= now || observation.credits < old.cold) {
+            if (!old || old.expires <= now || density < old.coldDensity) {
               if (old || scope.samples.size < LIMIT.samples) scope.samples.set(k, {
-                cold: observation.credits, expires: now + LIMIT.calibrationTtlMs
+                coldDensity: density, expires: now + LIMIT.calibrationTtlMs
               });
             }
           } else {
@@ -122,10 +136,11 @@ export class KiroCreditCache {
               if (b.tokens > matched) continue;
               const cold = scope.samples.get(sampleKey(b.fingerprint));
               if (!cold || cold.expires <= now) continue;
-              // Appended input raises warm cost: ignoring that cost underestimates
-              // savings. No input/output price slope or fixed cache ratio is assumed.
+              // Compare credits per total token so varying output lengths can pair.
+              // Keep the lowest cold density and rolling savings lower envelope;
+              // no input/output price split or exact cache rate is inferred.
               scope.pairs.push({ ratio: Math.max(0, Math.min(LIMIT.maxSavings,
-                (cold.cold - observation.credits) / cold.cold)), expires: now + LIMIT.calibrationTtlMs });
+                (cold.coldDensity - density) / cold.coldDensity)), expires: now + LIMIT.calibrationTtlMs });
               scope.pairs = scope.pairs.slice(-LIMIT.pairs);
               break;
             }

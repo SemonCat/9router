@@ -151,7 +151,7 @@ describe("native EOF plus selected successful client delivery", () => {
     const text = await run(nativeResponse({ credits: 2, extra: [kiroFrame("meteringEvent", { usage: 3, unit: "credit" })] }));
     expect(sseEvents(text).at(-1).usage).toMatchObject({ kiro_credits: 3, kiro_credit_unit: "credit" });
     const scope = [...kiroCreditCache.scopes.values()][0];
-    expect([...scope.samples.values()][0].cold).toBe(5);
+    expect([...scope.samples.values()][0].coldDensity).toBe(5 / 10020);
   });
 
   it("rejects a late abort even after native EOF, before a purported delivery success", async () => {
@@ -178,5 +178,44 @@ describe("native EOF plus selected successful client delivery", () => {
     }));
     receipts.reverse().forEach(receipt => settle(receipt, true));
     expect(counts()).toEqual([{ active: 0, prefixes: 1, samples: 0, pairs: 0 }]);
+  });
+});
+
+
+describe("late Kiro input estimation", () => {
+  it("fills missing input after output metrics and refreshes total before calibration", async () => {
+    const text = await run(nativeResponse({ metrics: { outputTokens: 37 }, extra: [
+      kiroFrame("contextUsageEvent", { contextUsagePercentage: 10 })
+    ] }));
+    const usage = sseEvents(text).findLast(e => e.usage)?.usage;
+    expect(usage.prompt_tokens).toBeGreaterThan(0);
+    expect(usage.completion_tokens).toBe(37);
+    expect(usage.total_tokens).toBe(usage.prompt_tokens + 37);
+    expect([...kiroCreditCache.scopes.values()][0].samples.values().next().value.coldDensity)
+      .toBe(10 / usage.total_tokens);
+  });
+  it("does not refill fully cached native input from context percentage", async () => {
+    const text = await run(nativeResponse({ metrics: { inputTokens: 0, outputTokens: 37, cacheReadInputTokens: 10000 },
+      extra: [kiroFrame("contextUsageEvent", { contextUsagePercentage: 50 })] }));
+    const usage = sseEvents(text).findLast(e => e.usage)?.usage;
+    expect(usage.prompt_tokens).toBe(10000);
+    expect(usage.total_tokens).toBe(10037);
+  });
+});
+
+
+describe("startup fallback delivery boundaries", () => {
+  it("does not apply or train a warmed fallback on a retried attempt", async () => {
+    const previous = kiroCreditCache.staticReadRatio;
+    kiroCreditCache.staticReadRatio = 0.4;
+    try {
+      await run(nativeResponse({ credits: 10 }));
+      const retry = await run(new Response("fixture failure", { status: 401 }));
+      expect(sseEvents(retry).at(-1).usage.prompt_tokens_details).toBeUndefined();
+      expect(counts()[0].pairs).toBe(0);
+      const next = await run(nativeResponse({ credits: 2 }), { written: false });
+      expect(sseEvents(next).at(-1).usage.prompt_tokens_details.cached_tokens).toBe(4000);
+      expect(counts()[0].pairs).toBe(0); // failed delivery cannot train the warm pair
+    } finally { kiroCreditCache.staticReadRatio = previous; }
   });
 });

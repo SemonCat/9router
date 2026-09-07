@@ -16,7 +16,7 @@ function request(model = "claude-opus-5", session = "session-a") {
   };
 }
 const usage = { prompt_tokens: 10000, completion_tokens: 20, total_tokens: 10020 };
-const observation = (credits, outputTokens = 20) => ({ credits, outputTokens, complete: true });
+const observation = (credits, outputTokens = 20) => ({ credits, outputTokens, inputTokens: 10000, totalTokens: 10000 + outputTokens, complete: true });
 function finish(cache, req, credits, success = true) {
   const p = cache.prepare(req);
   const result = p.apply(usage);
@@ -29,16 +29,19 @@ function train(cache, req) {
 const cached = (plan) => plan?.apply(usage).prompt_tokens_details?.cached_tokens || 0;
 
 describe("native-credit cache calibration", () => {
-  it("has no fixed savings; requires two comparable successful cold/warm pairs", () => {
+  it("uses the existing 90% bound on early warm calls, then two comparable pairs take over", () => {
     const cache = new KiroCreditCache();
     const req = request();
-    for (const credits of [10, 2, 2]) expect(finish(cache, req, credits)).toEqual(usage);
+    expect(finish(cache, req, 10)).toEqual(usage);
+    for (const credits of [2, 2]) {
+      expect(finish(cache, req, credits).prompt_tokens_details.cached_tokens).toBe(9000);
+    }
     const p = cache.prepare(req);
     expect(cached(p)).toBe(8000);
     expect(p.apply(usage).prompt_tokens).toBe(10000);
     p.complete(observation(8), true);
     expect(cached(p)).toBe(8000); // frozen plan, even after late metering
-    expect(cached(cache.prepare(req))).toBe(2000); // adverse evidence applies immediately
+    expect(cached(cache.prepare(req))).toBeCloseTo(2000, -1); // adverse evidence applies immediately
   });
 
   it("matches an append-only ladder with current/history wrappers normalized", () => {
@@ -130,10 +133,11 @@ describe("native-credit cache calibration", () => {
       plan.complete(observation(2), true);
       plan.complete(observation(10), true);
     }
-    expect(cached(overlap.prepare(req))).toBe(0);
+    expect([...overlap.scopes.values()][0].pairs).toHaveLength(0);
+    expect(cached(overlap.prepare(req))).toBe(9000); // only static fallback, no learned ratio
   });
 
-  it("does not pair differing output counts or inference configurations", () => {
+  it("does not pair differing inference configurations", () => {
     const cache = new KiroCreditCache();
     const req = request();
     finish(cache, req, 10);
@@ -256,4 +260,115 @@ describe("Kiro cache family policies", () => {
       const cache = new KiroCreditCache(); train(cache, request(model));
       expect(cached(cache.prepare(request(other)))).toBe(0);
     });
+});
+
+
+describe("real-traffic credit calibration", () => {
+  const observed = (credits, inputTokens, outputTokens, totalTokens = inputTokens + outputTokens) =>
+    ({ credits, inputTokens, outputTokens, totalTokens, complete: true });
+  it("uses configured fallback only on proven warmth, then normalized dynamic savings", () => {
+    const cache = new KiroCreditCache({ staticReadRatio: 0.4 });
+    const req = request();
+    const cold = cache.prepare(req); expect(cached(cold)).toBe(0);
+    cold.complete(observed(10, 9000, 1000), true);
+    const warm1 = cache.prepare(req); expect(cached(warm1)).toBe(4000);
+    warm1.complete(observed(2, 9000, 3000), true);
+    const warm2 = cache.prepare(req); expect(cached(warm2)).toBe(4000);
+    warm2.complete(observed(4, 9000, 1000), true);
+    const dynamic = cache.prepare(req);
+    expect(cached(dynamic)).toBe(6000); // lower envelope: min(5/6, 0.6)
+    expect(cached(warm2)).toBe(4000); // prepared estimate stays frozen
+  });
+  it("dynamic zero overrides static fallback even with unequal outputs", () => {
+    const cache = new KiroCreditCache({ staticReadRatio: 0.8 });
+    const req = request();
+    cache.prepare(req).complete(observed(10, 9000, 1000), true);
+    cache.prepare(req).complete(observed(12, 9000, 3000), true); // equal density => zero
+    cache.prepare(req).complete(observed(2, 9000, 500), true);
+    expect(cached(cache.prepare(req))).toBe(0);
+  });
+  it.each([undefined, 0, -1, NaN, Infinity])("uses safe input + output when total is %s", total => {
+    const cache = new KiroCreditCache(); const req = request();
+    const cold = observed(10, 9000, 1000); cold.totalTokens = total;
+    cache.prepare(req).complete(cold, true);
+    cache.prepare(req).complete(observed(4, 9000, 1000), true);
+    cache.prepare(req).complete(observed(5, 9000, 11000), true);
+    expect(cached(cache.prepare(req))).toBe(6000);
+  });
+  it("prefers an actual total, and skips invalid normalization instead of training", () => {
+    const cache = new KiroCreditCache(); const req = request();
+    cache.prepare(req).complete(observed(10, 9000, 1000, 20000), true);
+    cache.prepare(req).complete(observed(4, 9000, 1000, 20000), true);
+    cache.prepare(req).complete(observed(4, 9000, 2000, 20000), true);
+    expect(cached(cache.prepare(req))).toBe(6000);
+    const invalid = new KiroCreditCache();
+    invalid.prepare(req).complete({ credits:10, outputTokens:20, complete:true }, true);
+    expect([...invalid.scopes.values()][0].samples.size).toBe(0);
+  });
+  it("bounds startup estimates to the matched prefix and preserves explicit native zero", () => {
+    const cache = new KiroCreditCache({ staticReadRatio: 0.4 }); const req = request();
+    cache.prepare(req).complete(observed(10, 9000, 1000), true);
+    req.body.conversationState.history.push(req.body.conversationState.currentMessage,
+      { assistantResponseMessage: { content: "answer" } });
+    req.body.conversationState.currentMessage = user("new uncached content ".repeat(2000));
+    const p = cache.prepare(req);
+    expect(cached(p)).toBeGreaterThan(0); expect(cached(p)).toBeLessThan(4000);
+    const native = { ...usage, prompt_tokens_details: { cached_tokens: 0 } };
+    expect(p.apply(native)).toBe(native);
+  });
+});
+
+
+describe("startup fallback isolation", () => {
+  it.each([["claude-sonnet-5", 5, false], ["gpt-5.6-luna", 30, true]])("%s keeps model/account/endpoint/TTL isolation", (model, minutes, scoped) => {
+    let now = 0;
+    const cache = new KiroCreditCache({ now: () => now, staticReadRatio: 0.4 });
+    const req = request(model);
+    cache.prepare(req).complete(observation(10), true);
+    const probe = r => { const p = cache.prepare(r); const read = cached(p); p?.complete(null, false); return read; };
+    expect(probe(request(model, "other-session"))).toBe(scoped ? 0 : 4000);
+    for (const change of [
+      r => { r.credentials.connectionId = "other-account"; },
+      r => { r.endpoint += "/other"; },
+      r => { r.body.conversationState.currentMessage.userInputMessage.modelId = model + "-future"; },
+      r => { r.body.conversationState.agentContinuationId = "other-continuation"; },
+    ]) { const r = request(model); change(r); expect(probe(r)).toBe(0); }
+    expect(probe(req)).toBe(4000);
+    now = minutes * MINUTE;
+    expect(probe(req)).toBe(0);
+  });
+  it.each([0, -1, NaN, Infinity])("invalid/disabled static ratio %s cannot create an estimate", staticReadRatio => {
+    const cache = new KiroCreditCache({ staticReadRatio }); const req = request();
+    cache.prepare(req).complete(observation(10), true);
+    expect(cached(cache.prepare(req))).toBe(0);
+  });
+});
+
+
+describe("density bounds and recovery", () => {
+  it("keeps the lowest cold density when a prefix turns cold again", () => {
+    let now = 0; const cache = new KiroCreditCache({ now: () => now }); const req = request();
+    const observe = credits => cache.prepare(req).complete(observation(credits), true);
+    observe(10);
+    now = 6 * MINUTE; observe(4);
+    observe(2); observe(2);
+    expect(cached(cache.prepare(req))).toBe(5000);
+  });
+  it("retains authoritative zero until its pair leaves the eight-pair window", () => {
+    const cache = new KiroCreditCache({ staticReadRatio: 0.4 }); const req = request();
+    cache.prepare(req).complete(observation(10), true);
+    cache.prepare(req).complete(observation(12), true);
+    for (let i = 0; i < 8; i++) {
+      const outputTokens = 100 + i * 71, totalTokens = 10000 + outputTokens;
+      const p = cache.prepare(req);
+      if (i > 0) expect(cached(p)).toBe(0);
+      p.complete({ ...observation(2 * totalTokens / 10020, outputTokens), totalTokens }, true);
+    }
+    expect(cached(cache.prepare(req))).toBeGreaterThanOrEqual(7999);
+  });
+  it.each([-1, NaN, Infinity, Number.MAX_SAFE_INTEGER, undefined])("invalid fallback input %s cannot train density", inputTokens => {
+    const cache = new KiroCreditCache(); const req = request();
+    cache.prepare(req).complete({ credits:10, inputTokens, outputTokens:20, complete:true }, true);
+    expect([...cache.scopes.values()][0].samples.size).toBe(0);
+  });
 });

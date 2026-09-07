@@ -20,11 +20,13 @@ const { FORMATS } = await import("../../open-sse/translator/formats.js");
 const { kiroCreditCache } = await import("../../open-sse/services/kiroCreditCache.js");
 const { selectKiroCacheResponse } = await import("../../open-sse/services/kiroCacheDelivery.js");
 const { clearKiroSessionReplayStore } = await import("../../open-sse/utils/kiroSessionReplay.js");
+const originalStaticRatio = kiroCreditCache.staticReadRatio;
 beforeEach(() => {
+  kiroCreditCache.staticReadRatio = 0.4;
   kiroCreditCache.scopes.clear();
   clearKiroSessionReplayStore();
 });
-afterEach(() => vi.clearAllMocks());
+afterEach(() => { kiroCreditCache.staticReadRatio = originalStaticRatio; vi.clearAllMocks(); });
 
 describe("Kiro public usage boundaries", () => {
   it("preserves existing public credit fields without exposing estimator metadata", async () => {
@@ -33,7 +35,7 @@ describe("Kiro public usage boundaries", () => {
       stream: true, credentials: { accessToken: "fixture" } });
     const text = await result.response.text();
     expect(sseEvents(text).at(-1).usage).toMatchObject({ kiro_credits: 10, kiro_credit_unit: "credit" });
-    expect(text).not.toMatch(/calibration|fingerprint|observation|responseDelivery/);
+    expect(text).not.toMatch(/calibration|fingerprint|observation|responseDelivery|coldDensity|staticReadRatio|totalTokens/);
   });
 
   for (const sourceFormat of [FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES, FORMATS.CLAUDE]) {
@@ -50,7 +52,7 @@ describe("Kiro public usage boundaries", () => {
         credentials: { connectionId: "fixture", accessToken: "fixture", providerSpecificData: {} },
         connectionId: "fixture", sourceFormatOverride: sourceFormat });
       const text = await result.response.text();
-      expect(text).not.toMatch(/calibration|fingerprint|observation|responseDelivery/);
+      expect(text).not.toMatch(/calibration|fingerprint|observation|responseDelivery|coldDensity|staticReadRatio|totalTokens/);
       const events = stream ? sseEvents(text) : [JSON.parse(text)];
       const usage = events.map(e => e.response?.usage || e.usage).filter(Boolean).at(-1);
       expect(usage).toBeDefined();
@@ -76,10 +78,10 @@ describe("calibration through real request/response translators and chatCore", (
       const messages = [{ role: "user", content: "canonical prefix ".repeat(1600) }];
       const usages = [];
       try {
-        for (const credits of [10, 2, 2, 2]) {
+        for (const [credits, outputTokens] of [[10, 20], [2, 1300], [2, 300], [2, 70]]) {
           const delivery = { callbacks: new Set(), finished: false, selected: null };
           await storage.run(delivery, async () => {
-            fetchMock.mockResolvedValueOnce(nativeResponse({ credits }));
+            fetchMock.mockResolvedValueOnce(nativeResponse({ credits, metrics: { inputTokens: 10000, outputTokens } }));
             const body = { stream, max_tokens: 100, session_id: "fixture-session",
               ...(sourceFormat === FORMATS.OPENAI_RESPONSES ? { input: structuredClone(messages) } : { messages: structuredClone(messages) }) };
             const result = await handleChatCore({ body,
@@ -89,7 +91,7 @@ describe("calibration through real request/response translators and chatCore", (
               clientRawRequest: { headers: { "x-session-id": "fixture-session" } } });
             selectKiroCacheResponse(result.response);
             const text = await result.response.text();
-            expect(text).not.toMatch(/calibration|fingerprint|observation|responseDelivery/);
+            expect(text).not.toMatch(/calibration|fingerprint|observation|responseDelivery|coldDensity|staticReadRatio|totalTokens/);
             const events = stream ? sseEvents(text) : [JSON.parse(text)];
             const usage = events.map(e => e.response?.usage || e.usage).filter(Boolean).at(-1);
             usages.push(usage);
@@ -102,7 +104,9 @@ describe("calibration through real request/response translators and chatCore", (
           messages.push({ role: "assistant", content: "A complete answer." }, { role: "user", content: "continue" });
         }
         const read = u => u.cache_read_input_tokens ?? u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? 0;
-        expect(usages.slice(0, 3).map(read)).toEqual([0, 0, 0]);
+        expect(read(usages[0])).toBe(0);
+        expect(read(usages[1])).toBeGreaterThan(0);
+        expect(read(usages[2])).toBeGreaterThan(0);
         expect(read(usages[3])).toBeGreaterThan(5000);
         if (sourceFormat === FORMATS.CLAUDE) {
           expect(usages[3].input_tokens + read(usages[3])).toBe(usages[0].input_tokens);

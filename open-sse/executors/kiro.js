@@ -932,6 +932,7 @@ export class KiroExecutor extends BaseExecutor {
         const values = [metrics.inputTokens, metrics.outputTokens, cacheReadValue, cacheCreateValue];
         if (values.some(value => value !== undefined &&
             (value === null || !Number.isSafeInteger(Number(value)) || Number(value) < 0))) state.observationInvalid = true;
+        if (metrics.inputTokens !== undefined || hasCache) state.hasInputMetrics = true;
         const prompt = Number(metrics.inputTokens) || 0;
         const completion = Number(metrics.outputTokens) || 0;
         if (prompt || completion || hasCache) {
@@ -1128,10 +1129,10 @@ export class KiroExecutor extends BaseExecutor {
         return;
       }
 
-      if (state.hasMetering && state.hasContextUsage && !state.usage?.total_tokens) {
-        const completion = state.totalContentLength
+      if (state.hasMetering && state.hasContextUsage && !state.hasInputMetrics) {
+        const completion = state.usage?.completion_tokens ?? (state.totalContentLength
           ? Math.max(1, Math.floor(state.totalContentLength / 4))
-          : 0;
+          : 0);
         const prompt = Math.floor(state.contextUsagePercentage * contextWindow / 100);
         state.usage = {
           ...(state.usage || {}),
@@ -1143,6 +1144,8 @@ export class KiroExecutor extends BaseExecutor {
       const observation = {
         credits: state.credits,
         outputTokens: state.usage?.completion_tokens,
+        inputTokens: state.hasInputMetrics || state.hasContextUsage ? state.usage?.prompt_tokens : undefined,
+        totalTokens: state.hasInputMetrics || state.hasContextUsage ? state.usage?.total_tokens : undefined,
         complete: hasOutput && state.hasMetering && Number.isFinite(state.credits) && state.credits > 0 &&
           !state.observationInvalid && !state.toolValidationError &&
           !state.droppedTools && ["complete", "tool_use"].includes(disposition) && !truncatedAfterOutput

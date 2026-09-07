@@ -1,7 +1,8 @@
 # Kiro native-credit cache estimates
 
 Kiro cache simulation estimates cache reads from native-credit observations when
-Kiro does not report cache-token metrics. It does not assign a fixed cache ratio.
+Kiro does not report cache-token metrics. The existing 90% bound covers
+proven prefix reuse while dynamic calibration is still gathering observations.
 
 ## Prefix reuse and calibration
 
@@ -13,12 +14,22 @@ model-visible configuration remain significant; volatile text is not stripped to
 manufacture reuse. Prefix token weights approximate serialized characters / 4.
 
 A reuse index records successfully observed prefix fingerprints and their expiry.
-Calibration compares cold and warm native credits for matching prefixes, inference
-configuration and output-token counts. At least two comparable pairs are required.
-The estimate uses the lowest savings fraction among the last eight unexpired pairs,
-capped at 90%, weighted by the matched prefix's share of the request. Appended input
-and output costs remain in the warm bill, making this a conservative estimate.
-A zero-savings pair suppresses estimates until it expires or leaves that window.
+Calibration compares native credits per total token for matching prefixes and
+inference configuration, so cold and warm calls may have different output lengths.
+Each call uses its own valid total token count, with a validated input-plus-output
+fallback. Late input estimation refreshes the total before recording an observation.
+Missing or invalid normalization data cannot train billing pairs.
+
+With fewer than two valid pairs, the existing `LIMIT.maxSavings` ratio (0.9)
+applies only to
+canonically matched, unexpired prefixes. Cold requests and changed scopes receive
+no fallback. Once two valid pairs exist, dynamic calibration takes precedence,
+including a legitimate zero; it never falls back merely because savings are zero.
+The dynamic estimate uses the lowest savings fraction among the last eight
+unexpired pairs, capped at 90% and weighted by the matched prefix's share of input.
+The lowest observed cold density is retained. These conservative bounds reduce
+outlier influence, but total-token normalization does not establish separate
+input/output prices or guarantee an exact cache-hit rate.
 
 The estimate is frozen before the upstream request. A later successful observation
 can affect subsequent requests, but cannot change that request's frozen estimate.
