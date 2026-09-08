@@ -35,7 +35,7 @@ describe("Kiro public usage boundaries", () => {
       stream: true, credentials: { accessToken: "fixture" } });
     const text = await result.response.text();
     expect(sseEvents(text).at(-1).usage).toMatchObject({ kiro_credits: 10, kiro_credit_unit: "credit" });
-    expect(text).not.toMatch(/calibration|fingerprint|observation|responseDelivery|coldDensity|staticReadRatio|totalTokens/);
+    expect(text).not.toMatch(/calibration|fingerprint|observation|responseDelivery|coldDensity|staticReadRatio|totalTokens|cachedCreditRatio|creditSavings/);
   });
 
   for (const sourceFormat of [FORMATS.OPENAI, FORMATS.OPENAI_RESPONSES, FORMATS.CLAUDE]) {
@@ -52,7 +52,7 @@ describe("Kiro public usage boundaries", () => {
         credentials: { connectionId: "fixture", accessToken: "fixture", providerSpecificData: {} },
         connectionId: "fixture", sourceFormatOverride: sourceFormat });
       const text = await result.response.text();
-      expect(text).not.toMatch(/calibration|fingerprint|observation|responseDelivery|coldDensity|staticReadRatio|totalTokens/);
+      expect(text).not.toMatch(/calibration|fingerprint|observation|responseDelivery|coldDensity|staticReadRatio|totalTokens|cachedCreditRatio|creditSavings/);
       const events = stream ? sseEvents(text) : [JSON.parse(text)];
       const usage = events.map(e => e.response?.usage || e.usage).filter(Boolean).at(-1);
       expect(usage).toBeDefined();
@@ -91,7 +91,7 @@ describe("calibration through real request/response translators and chatCore", (
               clientRawRequest: { headers: { "x-session-id": "fixture-session" } } });
             selectKiroCacheResponse(result.response);
             const text = await result.response.text();
-            expect(text).not.toMatch(/calibration|fingerprint|observation|responseDelivery|coldDensity|staticReadRatio|totalTokens/);
+            expect(text).not.toMatch(/calibration|fingerprint|observation|responseDelivery|coldDensity|staticReadRatio|totalTokens|cachedCreditRatio|creditSavings/);
             const events = stream ? sseEvents(text) : [JSON.parse(text)];
             const usage = events.map(e => e.response?.usage || e.usage).filter(Boolean).at(-1);
             usages.push(usage);

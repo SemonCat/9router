@@ -29,8 +29,8 @@ export const KIRO_ENDPOINT_FALLBACK_STATUSES = new Set([401, 403, 404]);
 
 // Estimator policy, not a guarantee of provider cache retention or pricing.
 export const KIRO_CACHE_FAMILIES = Object.freeze({
-  claude: Object.freeze({ ttlMs: 5 * 60_000, minTokens: 4096 }),
-  gpt: Object.freeze({ ttlMs: 30 * 60_000, minTokens: 1024, conversationScoped: true })
+  claude: Object.freeze({ ttlMs: 5 * 60_000, minTokens: 4096, cachedCreditRatio: 0.525 }),
+  gpt: Object.freeze({ ttlMs: 30 * 60_000, minTokens: 1024, conversationScoped: true, cachedCreditRatio: 0.523 })
 });
 
 /** Classify policy only; never rewrite the outbound model or its cache scope. */

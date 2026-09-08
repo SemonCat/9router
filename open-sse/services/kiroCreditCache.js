@@ -55,6 +55,13 @@ function creditDensity(observation) {
   return Number.isFinite(density) && density > 0 ? density : null;
 }
 
+// Cached input still incurs credits. Convert savings to reuse only when the
+// family has a discount model; an uncalibrated policy keeps its legacy savings.
+export function inferKiroCacheReuse(creditSavings, policy) {
+  if (policy?.cachedCreditRatio === undefined) return creditSavings;
+  return Math.max(0, Math.min(1, creditSavings / (1 - policy.cachedCreditRatio)));
+}
+
 /** Bounded, process-local conservative calibration from comparable native credits. */
 export class KiroCreditCache {
   constructor({ now = Date.now, staticReadRatio = LIMIT.maxSavings } = {}) {
@@ -96,9 +103,10 @@ export class KiroCreditCache {
     const epoch = ++scope.epoch;
     scope.active++;
     // An available dynamic zero is authoritative; fallback is only for startup.
-    const ratio = scope.pairs.length >= LIMIT.minPairs
-      ? Math.min(LIMIT.maxSavings, ...scope.pairs.map(pair => pair.ratio)) : this.staticReadRatio;
-    const fraction = ratio * matched / p.tokens;
+    const reuse = scope.pairs.length >= LIMIT.minPairs
+      ? inferKiroCacheReuse(Math.min(LIMIT.maxSavings, ...scope.pairs.map(pair => pair.creditSavings)), policy)
+      : this.staticReadRatio;
+    const fraction = reuse * matched / p.tokens;
     let done = false;
     return {
       apply(usage) {
@@ -139,7 +147,7 @@ export class KiroCreditCache {
               // Compare credits per total token so varying output lengths can pair.
               // Keep the lowest cold density and rolling savings lower envelope;
               // no input/output price split or exact cache rate is inferred.
-              scope.pairs.push({ ratio: Math.max(0, Math.min(LIMIT.maxSavings,
+              scope.pairs.push({ creditSavings: Math.max(0, Math.min(LIMIT.maxSavings,
                 (cold.coldDensity - density) / cold.coldDensity)), expires: now + LIMIT.calibrationTtlMs });
               scope.pairs = scope.pairs.slice(-LIMIT.pairs);
               break;

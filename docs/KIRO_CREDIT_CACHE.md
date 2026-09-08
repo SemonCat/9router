@@ -21,15 +21,23 @@ fallback. Late input estimation refreshes the total before recording an observat
 Missing or invalid normalization data cannot train billing pairs.
 
 With fewer than two valid pairs, the existing `LIMIT.maxSavings` ratio (0.9)
-applies only to
-canonically matched, unexpired prefixes. Cold requests and changed scopes receive
+applies only to canonically matched, unexpired prefixes. Cold requests and changed scopes receive
 no fallback. Once two valid pairs exist, dynamic calibration takes precedence,
 including a legitimate zero; it never falls back merely because savings are zero.
-The dynamic estimate uses the lowest savings fraction among the last eight
-unexpired pairs, capped at 90% and weighted by the matched prefix's share of input.
-The lowest observed cold density is retained. These conservative bounds reduce
-outlier influence, but total-token normalization does not establish separate
-input/output prices or guarantee an exact cache-hit rate.
+The lowest observed cold density is retained. The dynamic estimate selects the
+lowest credit-savings fraction among the last eight unexpired pairs, capped at 90%.
+Cached input still incurs credits, so credit savings are converted to inferred
+reuse with `reuse = clamp(credit_savings / (1 - d), 0, 1)`: GPT uses `d = 0.523`,
+and Claude uses `d = 0.525`. This conversion applies only after two valid pairs;
+it does not alter startup fallback or turn zero savings into positive reuse.
+
+Inferred reuse is weighted by the canonical matched prefix's share of input. Thus
+calibrated reads can exceed 90% but never exceed that structural bound. Policies
+without a discount retain their raw-savings behavior; unknown models remain
+estimator-disabled. The family constants are fixed modeling assumptions, not
+provider-reported cache measurements. Total-token normalization and differing
+input/output costs can bias the inference; model/traffic variation is not modeled,
+and an exact cache-hit rate is not guaranteed.
 
 The estimate is frozen before the upstream request. A later successful observation
 can affect subsequent requests, but cannot change that request's frozen estimate.
